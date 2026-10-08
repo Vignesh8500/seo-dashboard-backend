@@ -1,7 +1,13 @@
+const dns = require('dns');
+dns.setServers(['8.8.8.8', '8.8.4.4']);
 require('dotenv').config();
+const mongoose = require('mongoose');
 const express = require('express');
 const cors = require('cors');
-const Database = require('better-sqlite3');
+const jwt = require('jsonwebtoken');
+const bcrypt = require('bcrypt');
+const rateLimit = require('express-rate-limit');
+const { Client, Snapshot, User } = require('./models');   
 const axios = require('axios');
 const cron = require('node-cron');
 const { google } = require('googleapis');
@@ -10,28 +16,37 @@ const Anthropic = require('@anthropic-ai/sdk');
 
 // ---------- SETUP ----------
 const app = express();
+if (!process.env.JWT_SECRET) {
+  console.error('JWT_SECRET is not set. Add it to your .env file.');
+  process.exit(1);
+}
+app.set('trust proxy', 1); // Render runs behind a proxy; needed for correct client IPs
 app.use(cors());
 app.use(express.json());
 
-const db = new Database('data.db');
-db.exec(`
-  CREATE TABLE IF NOT EXISTS clients (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    name TEXT NOT NULL,
-    ga4_property_id TEXT NOT NULL,
-    gsc_site_url TEXT NOT NULL,
-    semrush_domain TEXT,
-    status TEXT DEFAULT 'pending',
-    created_at TEXT DEFAULT (datetime('now'))
-  );
-  CREATE TABLE IF NOT EXISTS snapshots (
-    client_id INTEGER PRIMARY KEY,
-    data TEXT,
-    insights TEXT,
-    updated_at TEXT,
-    FOREIGN KEY (client_id) REFERENCES clients(id)
-  );
-`);
+// const db = new Database('data.db');
+// db.exec(`
+//   CREATE TABLE IF NOT EXISTS clients (
+//     id INTEGER PRIMARY KEY AUTOINCREMENT,
+//     name TEXT NOT NULL,
+//     ga4_property_id TEXT NOT NULL,
+//     gsc_site_url TEXT NOT NULL,
+//     semrush_domain TEXT,
+//     status TEXT DEFAULT 'pending',
+//     created_at TEXT DEFAULT (datetime('now'))
+//   );
+//   CREATE TABLE IF NOT EXISTS snapshots (
+//     client_id INTEGER PRIMARY KEY,
+//     data TEXT,
+//     insights TEXT,
+//     updated_at TEXT,
+//     FOREIGN KEY (client_id) REFERENCES clients(id)
+//   );
+// `);
+
+mongoose.connect(process.env.MONGODB_URI)
+  .then(() => console.log('MongoDB connected'))
+  .catch(err => console.error('MongoDB connection error:', err.message));
 
 const analyticsClient = new BetaAnalyticsDataClient({
   keyFilename: process.env.GOOGLE_SERVICE_ACCOUNT_KEY_PATH,
@@ -179,23 +194,23 @@ async function generateInsights(data) {
 
 async function refreshClient(client) {
   const [traffic, search, events, indexing, acquisition, devices, countries, topPages, pageBreakdown, pageKeywords] = await Promise.all([
-    getTrafficData(client.ga4_property_id),
-    getSearchData(client.gsc_site_url),
-    getEventsData(client.ga4_property_id),
-    getIndexingStatus(client.gsc_site_url).catch(e => { console.error(`Indexing failed for ${client.name}:`, e.message); return null; }),
-    getAcquisitionData(client.ga4_property_id).catch(e => { console.error(`Acquisition failed for ${client.name}:`, e.message); return { channels: [], sources: [] }; }),
-    getDeviceData(client.ga4_property_id).catch(e => { console.error(`Device data failed for ${client.name}:`, e.message); return []; }),
-    getCountryData(client.ga4_property_id).catch(e => { console.error(`Country data failed for ${client.name}:`, e.message); return []; }),
-    getTopPages(client.ga4_property_id).catch(e => { console.error(`Top pages failed for ${client.name}:`, e.message); return []; }),
-    getPageBreakdown(client.ga4_property_id).catch(e => { console.error(`Page breakdown failed for ${client.name}:`, e.message); return {}; }),
-    getPageKeywords(client.gsc_site_url).catch(e => { console.error(`Page keywords failed for ${client.name}:`, e.message); return {}; }),
+    getTrafficData(client.ga4PropertyId),
+    getSearchData(client.gscSiteUrl),
+    getEventsData(client.ga4PropertyId),
+    getIndexingStatus(client.gscSiteUrl).catch(e => { console.error(`Indexing failed for ${client.name}:`, e.message); return null; }),
+    getAcquisitionData(client.ga4PropertyId).catch(e => { console.error(`Acquisition failed for ${client.name}:`, e.message); return { channels: [], sources: [] }; }),
+    getDeviceData(client.ga4PropertyId).catch(e => { console.error(`Device data failed for ${client.name}:`, e.message); return []; }),
+    getCountryData(client.ga4PropertyId).catch(e => { console.error(`Country data failed for ${client.name}:`, e.message); return []; }),
+    getTopPages(client.ga4PropertyId).catch(e => { console.error(`Top pages failed for ${client.name}:`, e.message); return []; }),
+    getPageBreakdown(client.ga4PropertyId).catch(e => { console.error(`Page breakdown failed for ${client.name}:`, e.message); return {}; }),
+    getPageKeywords(client.gscSiteUrl).catch(e => { console.error(`Page keywords failed for ${client.name}:`, e.message); return {}; }),
   ]);
 
   let domain = null;
   let semrushStatus = 'not_added';
-  if (client.semrush_domain) {
+  if (client.semrushDomain) {
     try {
-      domain = await getDomainOverview(client.semrush_domain);
+      domain = await getDomainOverview(client.semrushDomain);
       semrushStatus = 'ok';
     } catch (e) {
       semrushStatus = 'error';
@@ -203,29 +218,26 @@ async function refreshClient(client) {
     }
   }
 
-  // Merge top pages with their breakdown + keywords into one structure
   const blogPages = topPages.map(p => {
-  // Find the matching GSC entry by checking if any key ends with this path
-  const matchingKeywordsEntry = Object.entries(pageKeywords).find(([url]) => url.endsWith(p.path));
-  return {
-    ...p,
-    topSources: pageBreakdown[p.path]?.topSources || [],
-    topDevices: pageBreakdown[p.path]?.topDevices || [],
-    topKeywords: matchingKeywordsEntry ? matchingKeywordsEntry[1] : [],
-  };
-});
+    const match = Object.entries(pageKeywords).find(([url]) => url.endsWith(p.path));
+    return {
+      ...p,
+      topSources: pageBreakdown[p.path]?.topSources || [],
+      topDevices: pageBreakdown[p.path]?.topDevices || [],
+      topKeywords: match ? match[1] : [],
+    };
+  });
 
   const data = { traffic, search, events, indexing, acquisition, devices, countries, blogPages, domain, semrushStatus };
   const insights = await generateInsights(data);
-  const updatedAt = new Date().toISOString();
 
-  db.prepare(`
-    INSERT INTO snapshots (client_id, data, insights, updated_at)
-    VALUES (?, ?, ?, ?)
-    ON CONFLICT(client_id) DO UPDATE SET data=excluded.data, insights=excluded.insights, updated_at=excluded.updated_at
-  `).run(client.id, JSON.stringify(data), insights, updatedAt);
+  await Snapshot.findOneAndUpdate(
+    { clientId: client._id },
+    { clientId: client._id, data, insights, updatedAt: new Date() },
+    { upsert: true, new: true }
+  );
 
-  return { data, insights, updatedAt };
+  return { data, insights };
 }
 
 
@@ -378,16 +390,111 @@ async function getPageKeywords(siteUrl) {
   return result;
 }
 
-// ---------- ROUTES ----------
+// ---------- AUTH ----------
 
-// List all clients
-app.get('/api/clients', (req, res) => {
-  const rows = db.prepare('SELECT id, name, status FROM clients ORDER BY name').all();
-  res.json(rows);
+const loginLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 10,
+  standardHeaders: true,
+  legacyHeaders: false,
+  message: { message: 'Too many login attempts. Try again in 15 minutes.' },
 });
 
-// Add + verify a new client
-app.post('/api/clients', async (req, res) => {
+// Verifies the token AND re-checks the user in the database, so deleting
+// a user (or changing their role) takes effect immediately.
+async function requireAuth(req, res, next) {
+  const header = req.headers.authorization || '';
+  const token = header.startsWith('Bearer ') ? header.slice(7) : null;
+  if (!token) return res.status(401).json({ message: 'Not authenticated.' });
+
+  try {
+    const payload = jwt.verify(token, process.env.JWT_SECRET);
+    const user = await User.findById(payload.id);
+    if (!user) return res.status(401).json({ message: 'Account no longer exists.' });
+    req.user = { id: user._id.toString(), username: user.username, role: user.role };
+    next();
+  } catch {
+    return res.status(401).json({ message: 'Session expired. Please log in again.' });
+  }
+}
+
+function requireAdmin(req, res, next) {
+  if (req.user?.role !== 'admin') {
+    return res.status(403).json({ message: 'Admin access required.' });
+  }
+  next();
+}
+
+app.post('/api/auth/login', loginLimiter, async (req, res) => {
+  const username = String(req.body.username || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+  if (!username || !password) {
+    return res.status(400).json({ message: 'Username and password are required.' });
+  }
+
+  const user = await User.findOne({ username });
+  const valid = user && await bcrypt.compare(password, user.passwordHash);
+  if (!valid) return res.status(401).json({ message: 'Invalid username or password.' });
+
+  const token = jwt.sign({ id: user._id.toString() }, process.env.JWT_SECRET, { expiresIn: '7d' });
+  res.json({ token, user: { username: user.username, role: user.role } });
+});
+
+app.get('/api/auth/me', requireAuth, (req, res) => {
+  res.json({ username: req.user.username, role: req.user.role });
+});
+
+// ----- Admin: manage user accounts -----
+
+app.get('/api/users', requireAuth, requireAdmin, async (req, res) => {
+  const users = await User.find().sort({ createdAt: 1 });
+  res.json(users.map(u => ({ id: u._id, username: u.username, role: u.role, createdAt: u.createdAt })));
+});
+
+app.post('/api/users', requireAuth, requireAdmin, async (req, res) => {
+  const username = String(req.body.username || '').trim().toLowerCase();
+  const password = String(req.body.password || '');
+  const role = req.body.role === 'admin' ? 'admin' : 'user';
+
+  if (username.length < 3) return res.status(400).json({ message: 'Username must be at least 3 characters.' });
+  if (password.length < 8) return res.status(400).json({ message: 'Password must be at least 8 characters.' });
+  if (await User.findOne({ username })) return res.status(409).json({ message: 'That username is already taken.' });
+
+  const user = await User.create({ username, passwordHash: await bcrypt.hash(password, 12), role });
+  res.json({ id: user._id, username: user.username, role: user.role });
+});
+
+app.patch('/api/users/:id/password', requireAuth, requireAdmin, async (req, res) => {
+  const password = String(req.body.password || '');
+  if (password.length < 8) return res.status(400).json({ message: 'Password must be at least 8 characters.' });
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ message: 'User not found.' });
+
+  const user = await User.findById(req.params.id);
+  if (!user) return res.status(404).json({ message: 'User not found.' });
+
+  user.passwordHash = await bcrypt.hash(password, 12);
+  await user.save();
+  res.json({ status: 'ok' });
+});
+
+app.delete('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ message: 'User not found.' });
+  if (req.params.id === req.user.id) return res.status(400).json({ message: "You can't delete your own account." });
+  await User.findByIdAndDelete(req.params.id);
+  res.json({ status: 'ok' });
+});
+
+// ---------- ROUTES ----------
+
+// ---------- ROUTES ----------
+
+// The frontend expects `id`, so map Mongo's _id to it
+app.get('/api/clients', requireAuth, async (req, res) => {
+  const clients = await Client.find().sort({ name: 1 });
+  res.json(clients.map(c => ({ id: c._id, name: c.name, status: c.status })));
+});
+
+app.post('/api/clients', requireAuth, requireAdmin, async (req, res) => {
   const { name, ga4PropertyId, gscSiteUrl, semrushDomain } = req.body;
   if (!name || !ga4PropertyId || !gscSiteUrl) {
     return res.status(400).json({ message: 'Client name, GA4 Property ID, and Search Console Site URL are required.' });
@@ -405,7 +512,6 @@ app.post('/api/clients', async (req, res) => {
     return res.status(400).json({ message: `Search Console connection failed. Confirm the site URL matches exactly (use sc-domain:example.com for Domain properties) and the service account has been added as a user. (${e.message})` });
   }
 
-  // Semrush is optional — validate only if provided, but never block saving
   if (semrushDomain) {
     try {
       await getDomainOverview(semrushDomain);
@@ -414,74 +520,41 @@ app.post('/api/clients', async (req, res) => {
     }
   }
 
-  const result = db.prepare(`
-    INSERT INTO clients (name, ga4_property_id, gsc_site_url, semrush_domain, status)
-    VALUES (?, ?, ?, ?, 'verified')
-  `).run(name, ga4PropertyId, gscSiteUrl, semrushDomain || null);
+  const client = await Client.create({
+    name,
+    ga4PropertyId,
+    gscSiteUrl,
+    semrushDomain: semrushDomain || null,
+    status: 'verified',
+  });
 
-  const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(result.lastInsertRowid);
   refreshClient(client).catch(err => console.error('Initial refresh failed:', err.message));
-
-  res.json({ id: result.lastInsertRowid });
+  res.json({ id: client._id });
 });
 
-// Get dashboard data for a client (from cached snapshot)
-app.get('/api/dashboard/:clientId', (req, res) => {
-  const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(req.params.clientId);
+app.get('/api/dashboard/:clientId', requireAuth, async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.clientId)) {
+    return res.status(404).json({ message: 'Client not found.' });
+  }
+  const client = await Client.findById(req.params.clientId);
   if (!client) return res.status(404).json({ message: 'Client not found.' });
 
-  const snapshot = db.prepare('SELECT * FROM snapshots WHERE client_id = ?').get(client.id);
+  const snapshot = await Snapshot.findOne({ clientId: client._id });
   if (!snapshot) return res.status(404).json({ message: 'No data yet — trigger a refresh.' });
 
   res.json({
     client: client.name,
-    data: JSON.parse(snapshot.data),
+    data: snapshot.data,
     insights: snapshot.insights,
-    updatedAt: snapshot.updated_at,
+    updatedAt: snapshot.updatedAt,
   });
 });
-//---------------------------CLAUDE MINI CHAT BOX-----------------------------------------------------------------
 
-app.post('/api/dashboard/:clientId/ask', async (req, res) => {
-  const { question } = req.body;
-  if (!question || !question.trim()) {
-    return res.status(400).json({ message: 'Question cannot be empty.' });
+app.post('/api/dashboard/:clientId/refresh', requireAuth, async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.clientId)) {
+    return res.status(404).json({ message: 'Client not found.' });
   }
-
-  const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(req.params.clientId);
-  if (!client) return res.status(404).json({ message: 'Client not found.' });
-
-  const snapshot = db.prepare('SELECT data FROM snapshots WHERE client_id = ?').get(client.id);
-  if (!snapshot) return res.status(400).json({ message: 'No data yet for this client — refresh first.' });
-
-  const data = JSON.parse(snapshot.data);
-
-  try {
-    const msg = await anthropic.messages.create({
-        model: 'claude-sonnet-5',
-        max_tokens: 1024,
-        thinking: { type: 'disabled' },
-        messages: [{
-            role: 'user',
-            content: `You are an SEO analyst assistant for the client "${client.name}". Answer the question using ONLY the data below — cite specific numbers where relevant. If the data doesn't contain what's needed to answer, say so plainly rather than guessing.\n\nData:\n${JSON.stringify(data)}\n\nQuestion: ${question}`,
-        }],
-    });
-
-    console.log('Claude raw response content:', JSON.stringify(msg.content, null, 2));
-
-    const textBlock = msg.content.find(block => block.type === 'text');
-    const answer = textBlock?.text || 'Claude returned a response with no readable text — check backend logs.';
-
-    res.json({ answer });
-  } catch (e) {
-    console.error('Ask Claude failed:', e.message);
-    res.status(500).json({ message: `Claude request failed: ${e.message}` });
-  }
-});
-
-// Force refresh a client's data
-app.post('/api/dashboard/:clientId/refresh', async (req, res) => {
-  const client = db.prepare('SELECT * FROM clients WHERE id = ?').get(req.params.clientId);
+  const client = await Client.findById(req.params.clientId);
   if (!client) return res.status(404).json({ message: 'Client not found.' });
 
   try {
@@ -491,18 +564,53 @@ app.post('/api/dashboard/:clientId/refresh', async (req, res) => {
     res.status(500).json({ message: `Refresh failed: ${e.message}` });
   }
 });
-//------------------delete client data-------------------------
-app.delete('/api/clients/:id', (req, res) => {
-  const id = req.params.id;
-  db.prepare('DELETE FROM snapshots WHERE client_id = ?').run(id);
-  db.prepare('DELETE FROM clients WHERE id = ?').run(id);
+
+app.post('/api/dashboard/:clientId/ask', requireAuth, async (req, res) => {
+  const { question } = req.body;
+  if (!question || !question.trim()) {
+    return res.status(400).json({ message: 'Question cannot be empty.' });
+  }
+  if (!mongoose.isValidObjectId(req.params.clientId)) {
+    return res.status(404).json({ message: 'Client not found.' });
+  }
+
+  const client = await Client.findById(req.params.clientId);
+  if (!client) return res.status(404).json({ message: 'Client not found.' });
+
+  const snapshot = await Snapshot.findOne({ clientId: client._id });
+  if (!snapshot) return res.status(400).json({ message: 'No data yet for this client — refresh first.' });
+
+  try {
+    const msg = await anthropic.messages.create({
+      model: 'claude-sonnet-5',
+      max_tokens: 1024,
+      thinking: { type: 'disabled' },
+      messages: [{
+        role: 'user',
+        content: `You are an SEO analyst assistant for the client "${client.name}". Answer the question using ONLY the data below — cite specific numbers where relevant. If the data doesn't contain what's needed to answer, say so plainly rather than guessing.\n\nData:\n${JSON.stringify(snapshot.data)}\n\nQuestion: ${question}`,
+      }],
+    });
+    const textBlock = msg.content.find(block => block.type === 'text');
+    res.json({ answer: textBlock?.text || 'Claude returned no readable text.' });
+  } catch (e) {
+    console.error('Ask Claude failed:', e.message);
+    res.status(500).json({ message: `Claude request failed: ${e.message}` });
+  }
+});
+
+app.delete('/api/clients/:id', requireAuth, requireAdmin, async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) {
+    return res.status(404).json({ message: 'Client not found.' });
+  }
+  await Snapshot.deleteOne({ clientId: req.params.id });
+  await Client.findByIdAndDelete(req.params.id);
   res.json({ status: 'ok' });
 });
 
 // ---------- SCHEDULED DAILY REFRESH ----------
 cron.schedule('0 6 * * *', async () => {
   console.log('Running daily refresh for all clients…');
-  const clients = db.prepare('SELECT * FROM clients').all();
+  const clients = await Client.find();
   for (const client of clients) {
     try {
       await refreshClient(client);
