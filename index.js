@@ -66,7 +66,7 @@ async function getTrafficData(propertyId) {
     property: `properties/${propertyId}`,
     dateRanges: [{ startDate: '28daysAgo', endDate: 'today' }],
     dimensions: [{ name: 'date' }],
-    metrics: [{ name: 'sessions' }, { name: 'activeUsers' }, { name: 'conversions' }],
+    metrics: [{ name: 'sessions' }, { name: 'activeUsers' }, { name: 'keyEvents' }],
   });
   if (!response.rows) return [];
 
@@ -182,7 +182,7 @@ async function generateInsights(data) {
       max_tokens: 2000,
       messages: [{
         role: 'user',
-        content: `You are an SEO analyst. Given this GA4 traffic, GA4 events, Search Console query, and indexing data, write a concise summary (max 220 words) covering: key trends, any anomalies, indexing issues if notIndexed is high relative to submitted, and 3 concrete action items.${semrushNote}\n\nData:\n${JSON.stringify(data)}`,
+        content: `You are an SEO analyst. Given this GA4 traffic, GA4 events, Search Console query, and indexing data, write a concise summary (max 220 words) covering: key trends, any anomalies, indexing issues if notIndexed is high relative to submitted, and 3 concrete action items.${semrushNote}\n\nData:\n${JSON.stringify(data)} Note: "conversions" counts GA4 key events. If it is 0, do not treat that as a funnel failure; say that key events may not be configured in GA4 and suggest marking the relevant events.`,
       }],
     });
     return msg.content[0].text;
