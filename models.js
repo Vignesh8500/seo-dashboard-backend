@@ -5,6 +5,8 @@ const clientSchema = new mongoose.Schema({
   ga4PropertyId: { type: String, required: true },
   gscSiteUrl: { type: String, required: true },
   semrushDomain: { type: String, default: null },
+  slackWebhookUrl: { type: String, default: '' },
+  emailRecipients: { type: [String], default: [] },
   status: { type: String, default: 'pending' },
 }, { timestamps: true });
 
@@ -25,4 +27,24 @@ const Client = mongoose.model('Client', clientSchema);
 const Snapshot = mongoose.model('Snapshot', snapshotSchema);
 const User = mongoose.model('User', userSchema);
 
-module.exports = { Client, Snapshot, User };
+
+const digestSchema = new mongoose.Schema({
+  clientId: { type: mongoose.Schema.Types.ObjectId, ref: 'Client', required: true },
+  weekKey: { type: String, required: true },
+  range: { start: String, end: String },
+  status: { type: String, enum: ['draft', 'sending', 'sent', 'failed', 'discarded'], default: 'draft' },
+  slackText: String, emailSubject: String, emailBody: String,
+  delivery: {
+    slack: { status: String, error: String, at: Date },
+    email: { status: String, error: String, at: Date },
+    weeklyReport: { type: Boolean, default: false },
+    emailEnabled: { type: Boolean, default: true },
+    slackEnabled: { type: Boolean, default: true },
+  },
+  approvedBy: String,
+  sentAt: Date,
+}, { timestamps: true });
+digestSchema.index({ clientId: 1, weekKey: 1 }, { unique: true });
+const Digest = mongoose.model('Digest', digestSchema);
+
+module.exports = { Client, Snapshot, User, Digest };

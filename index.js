@@ -7,12 +7,14 @@ const cors = require('cors');
 const jwt = require('jsonwebtoken');
 const bcrypt = require('bcrypt');
 const rateLimit = require('express-rate-limit');
-const { Client, Snapshot, User } = require('./models');   
+const { Client, Snapshot, User, Digest } = require('./models');   //added digest
 const axios = require('axios');
 const cron = require('node-cron');
 const { google } = require('googleapis');
 const { BetaAnalyticsDataClient } = require('@google-analytics/data');
 const Anthropic = require('@anthropic-ai/sdk');
+const crypto = require('crypto');
+
 
 // ---------- SETUP ----------
 const app = express();
@@ -483,6 +485,797 @@ app.delete('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
   await User.findByIdAndDelete(req.params.id);
   res.json({ status: 'ok' });
 });
+
+
+// ---------- COMPARISON ("What changed") ----------
+
+class HttpError extends Error {
+  constructor(status, message) { super(message); this.status = status; }
+}
+
+const DAY_MS = 86400000;
+const DATE_RE = /^\d{4}-\d{2}-\d{2}$/;
+const fmtDate = d => d.toISOString().slice(0, 10);
+const parseDate = s => new Date(`${s}T00:00:00Z`);
+const addDays = (d, n) => new Date(d.getTime() + n * DAY_MS);
+const pctChange = (cur, prev) => (prev > 0 ? ((cur - prev) / prev) * 100 : cur > 0 ? null : 0);
+
+function clampNum(value, fallback, min, max) {
+  const n = Number(value);
+  if (!Number.isFinite(n)) return fallback;
+  return Math.min(max, Math.max(min, n));
+}
+
+// Turns ?days=28 or ?start=&end= into the selected range plus the equal-length range before it
+function resolveRange(q) {
+  const today = parseDate(fmtDate(new Date()));
+  let start, end;
+
+  if (q.start || q.end) {
+    if (!DATE_RE.test(q.start || '') || !DATE_RE.test(q.end || '')) {
+      throw new HttpError(400, 'Pick both a start and an end date.');
+    }
+    start = parseDate(q.start);
+    end = parseDate(q.end);
+    if (isNaN(start) || isNaN(end)) throw new HttpError(400, 'That date is not valid.');
+  } else {
+    const days = [7, 28, 90].includes(Number(q.days)) ? Number(q.days) : 28;
+    end = addDays(today, -1);
+    start = addDays(end, -(days - 1));
+  }
+
+  if (start > end) throw new HttpError(400, 'Start date must be before the end date.');
+  if (end >= today) throw new HttpError(400, 'End date must be before today.');
+  const len = Math.round((end - start) / DAY_MS) + 1;
+  if (len > 365) throw new HttpError(400, 'Pick a range of 365 days or less.');
+
+  const prevEnd = addDays(start, -1);
+  const prevStart = addDays(prevEnd, -(len - 1));
+  return { start: fmtDate(start), end: fmtDate(end), prevStart: fmtDate(prevStart), prevEnd: fmtDate(prevEnd), len };
+}
+
+// Search Console data lags ~3 days. Shift the whole window earlier so both periods stay complete.
+function shiftForGsc(r) {
+  const limit = addDays(parseDate(fmtDate(new Date())), -3);
+  const end = parseDate(r.end);
+  if (end <= limit) return { ...r, shiftedDays: 0 };
+  const shift = Math.round((end - limit) / DAY_MS);
+  const mv = s => fmtDate(addDays(parseDate(s), -shift));
+  return { start: mv(r.start), end: mv(r.end), prevStart: mv(r.prevStart), prevEnd: mv(r.prevEnd), len: r.len, shiftedDays: shift };
+}
+
+async function getGa4Totals(propertyId, start, end) {
+  const [response] = await analyticsClient.runReport({
+    property: `properties/${propertyId}`,
+    dateRanges: [{ startDate: start, endDate: end }],
+    metrics: [{ name: 'sessions' }, { name: 'activeUsers' }, { name: 'keyEvents' }],
+  });
+  const row = response.rows?.[0];
+  const v = i => Number(row?.metricValues?.[i]?.value || 0);
+  return { sessions: v(0), users: v(1), keyEvents: v(2) };
+}
+
+// No dimensions = one totals row. With dimensions, pages through up to 75k rows.
+async function gscQuery(siteUrl, start, end, dimensions = []) {
+  const authClient = await googleAuth.getClient();
+  const sc = google.searchconsole({ version: 'v1', auth: authClient });
+  const PAGE = 25000;
+  const rows = [];
+  for (let startRow = 0; startRow < PAGE * 3; startRow += PAGE) {
+    const res = await sc.searchanalytics.query({
+      siteUrl,
+      requestBody: {
+        startDate: start,
+        endDate: end,
+        rowLimit: PAGE,
+        startRow,
+        ...(dimensions.length ? { dimensions } : {}),
+      },
+    });
+    const batch = res.data.rows || [];
+    rows.push(...batch);
+    if (batch.length < PAGE) break;
+  }
+  return rows;
+}
+
+function findMovers(curRows, prevRows, t, filterKey = () => true) {
+  const toMap = rows => new Map(rows.map(r => [r.keys[0], r]));
+  const cur = toMap(curRows);
+  const prev = toMap(prevRows);
+  const items = [];
+
+  for (const key of new Set([...cur.keys(), ...prev.keys()])) {
+    if (!filterKey(key)) continue;
+    const c = cur.get(key);
+    const p = prev.get(key);
+    const clicks = c?.clicks || 0;
+    const prevClicks = p?.clicks || 0;
+    const position = c?.position ?? null;
+    const prevPosition = p?.position ?? null;
+    items.push({
+      key,
+      clicks,
+      prevClicks,
+      impressions: c?.impressions || 0,
+      prevImpressions: p?.impressions || 0,
+      position,
+      prevPosition,
+      clickChangePct: pctChange(clicks, prevClicks), // null = new (no clicks last period)
+      positionDelta: position != null && prevPosition != null ? prevPosition - position : null, // positive = moved up
+    });
+  }
+
+  const enoughImpr = i => Math.max(i.impressions, i.prevImpressions) >= t.minImpressions;
+  const top = (arr, cmp) => arr.sort(cmp).slice(0, 15);
+
+  return {
+    positionUp: top(
+      items.filter(i => i.positionDelta != null && i.positionDelta >= t.position && enoughImpr(i)),
+      (a, b) => b.positionDelta - a.positionDelta
+    ),
+    positionDown: top(
+      items.filter(i => i.positionDelta != null && i.positionDelta <= -t.position && enoughImpr(i)),
+      (a, b) => a.positionDelta - b.positionDelta
+    ),
+    clickLosers: top(
+      items.filter(i => i.prevClicks >= t.minClicks && i.clickChangePct <= -t.clickPct),
+      (a, b) => (a.clicks - a.prevClicks) - (b.clicks - b.prevClicks)
+    ),
+    clickWinners: top(
+      items.filter(i => i.clicks >= t.minClicks && (i.clickChangePct == null || i.clickChangePct >= t.clickPct)),
+      (a, b) => (b.clicks - b.prevClicks) - (a.clicks - a.prevClicks)
+    ),
+  };
+}
+
+// const compareCache = new Map();
+// const COMPARE_CACHE_MS = 10 * 60 * 1000;
+
+// app.get('/api/dashboard/:clientId/compare', requireAuth, async (req, res) => {
+  
+
+//   try {
+
+//     if (!mongoose.isValidObjectId(req.params.clientId)) {
+//     return res.status(404).json({ message: 'Client not found.' });
+//   }
+//   const client = await Client.findById(req.params.clientId);
+//   if (!client) return res.status(404).json({ message: 'Client not found.' });
+  
+//     const range = resolveRange(req.query);
+//     const t = {
+//       position: clampNum(req.query.positionDelta, 3, 1, 50),
+//       clickPct: clampNum(req.query.clickPct, 20, 1, 100),
+//       minClicks: clampNum(req.query.minClicks, 5, 1, 10000),
+//       minImpressions: clampNum(req.query.minImpressions, 20, 1, 100000),
+//     };
+//     const blogOnly = req.query.blogOnly === 'true';
+
+//     const cacheKey = JSON.stringify([client._id, range, t, blogOnly]);
+//     const hit = compareCache.get(cacheKey);
+//     if (hit && Date.now() - hit.at < COMPARE_CACHE_MS) return res.json(hit.body);
+
+//     const g = shiftForGsc(range);
+//     const [gaCur, gaPrev, gscTotCur, gscTotPrev, qCur, qPrev, pCur, pPrev] = await Promise.all([
+//       getGa4Totals(client.ga4PropertyId, range.start, range.end),
+//       getGa4Totals(client.ga4PropertyId, range.prevStart, range.prevEnd),
+//       gscQuery(client.gscSiteUrl, g.start, g.end),
+//       gscQuery(client.gscSiteUrl, g.prevStart, g.prevEnd),
+//       gscQuery(client.gscSiteUrl, g.start, g.end, ['query']),
+//       gscQuery(client.gscSiteUrl, g.prevStart, g.prevEnd, ['query']),
+//       gscQuery(client.gscSiteUrl, g.start, g.end, ['page']),
+//       gscQuery(client.gscSiteUrl, g.prevStart, g.prevEnd, ['page']),
+//     ]);
+
+//     const tot = rows => rows[0] || { clicks: 0, impressions: 0, ctr: 0, position: 0 };
+//     const sc = tot(gscTotCur);
+//     const sp = tot(gscTotPrev);
+//     const metric = (cur, prev) => ({ cur, prev, changePct: pctChange(cur, prev) });
+
+//     const body = {
+//       range,
+//       gscRange: g,
+//       thresholds: { ...t, blogOnly },
+//       totals: {
+//         sessions: metric(gaCur.sessions, gaPrev.sessions),
+//         users: metric(gaCur.users, gaPrev.users),
+//         keyEvents: metric(gaCur.keyEvents, gaPrev.keyEvents),
+//         clicks: metric(sc.clicks, sp.clicks),
+//         impressions: metric(sc.impressions, sp.impressions),
+//         ctr: metric(sc.ctr * 100, sp.ctr * 100),
+//         position: {
+//           cur: sc.position || null,
+//           prev: sp.position || null,
+//           delta: sc.position && sp.position ? sp.position - sc.position : null, // positive = improved
+//         },
+//       },
+//       queries: findMovers(qCur, qPrev, t),
+//       pages: findMovers(pCur, pPrev, t, blogOnly ? key => key.includes('/blog') : () => true),
+//     };
+
+//     if (compareCache.size > 200) compareCache.clear();
+//     compareCache.set(cacheKey, { at: Date.now(), body });
+//     res.json(body);
+//   } catch (e) {
+//     if (e instanceof HttpError) return res.status(e.status).json({ message: e.message });
+//     console.error('Compare failed:', e.message);
+//     res.status(500).json({ message: `Comparison failed: ${e.message}` });
+//   }
+// });
+
+
+
+
+
+// =====================================================================
+// COMPARISON v2 + EXPLANATIONS + WEEKLY DIGEST  (version 2: with switches + test mode)
+//
+// WHERE: if you pasted the earlier version of this block, delete it completely
+// (from `const compareCache = new Map();` to the line `}, 30 * 1000);` at its end)
+// and paste this whole file in its place. If you never pasted it, delete everything
+// from `const compareCache = new Map();` to the end of the old compare route and
+// paste this in its place. Either way it stays above `// ---------- ROUTES`.
+//
+// ALSO at the top of index.js:
+//   const crypto = require('crypto');
+//   const { Client, Snapshot, User, Digest } = require('./models');
+// =====================================================================
+
+const compareCache = new Map();
+const COMPARE_CACHE_MS = 10 * 60 * 1000;
+
+// ---------- Rule-based "likely cause" reasoning (our own data only) ----------
+const LEVELS = ['low', 'medium', 'high'];
+const downLevel = c => LEVELS[Math.max(0, LEVELS.indexOf(c) - 1)];
+
+function explainItem(i, t) {
+  const imprPct = pctChange(i.impressions, i.prevImpressions); // null = no impressions last period
+  const pd = i.positionDelta; // positive = moved up
+  const volume = Math.max(i.impressions, i.prevImpressions);
+  let cause, confidence, note = '';
+
+  if (i.prevClicks === 0 && i.clicks > 0) {
+    cause = 'New or newly visible'; confidence = 'medium'; note = 'No clicks in the previous period.';
+  } else {
+    // Direction: a big position move wins, otherwise follow the clicks
+    let dir;
+    if (pd != null && Math.abs(pd) >= t.position) dir = pd > 0 ? 'up' : 'down';
+    else dir = i.clicks > i.prevClicks ? 'up' : i.clicks < i.prevClicks ? 'down' : 'flat';
+
+    if (dir === 'flat') {
+      cause = 'No clear change'; confidence = 'low';
+    } else if (dir === 'up') {
+      if (pd != null && pd >= 1) { cause = 'Ranking gain'; confidence = imprPct == null || imprPct >= 10 ? 'high' : 'medium'; }
+      else if (imprPct == null || imprPct >= 20) { cause = 'Higher demand or visibility'; confidence = 'medium'; }
+      else { cause = 'Better click-through'; confidence = 'low'; note = 'Position and impressions are flat. Check whether the title or snippet changed.'; }
+      if (i.clicks < i.prevClicks) note = (note ? note + ' ' : '') + 'Clicks have not followed the ranking yet.';
+    } else {
+      if (i.impressions === 0) { cause = 'Lost visibility in results'; confidence = 'medium'; }
+      else if (pd != null && pd <= -1) { cause = 'Ranking loss'; confidence = imprPct != null && imprPct <= -10 ? 'high' : 'medium'; }
+      else if (imprPct != null && imprPct <= -20) { cause = 'Lower demand or visibility'; confidence = 'medium'; }
+      else { cause = 'Lower click-through'; confidence = 'low'; note = 'Position and impressions are steady. Possible SERP change, check the live results manually.'; }
+      if (i.clicks > i.prevClicks) note = (note ? note + ' ' : '') + 'Clicks have not dropped yet.';
+    }
+    if (volume < 100) {
+      confidence = downLevel(confidence);
+      note = (note ? note + ' ' : '') + 'Low volume, treat as a signal only.';
+    }
+  }
+  return { cause, confidence, note };
+}
+
+function explainTotals(t) {
+  const out = [];
+  const s = t.sessions.changePct, c = t.clicks.changePct, k = t.keyEvents.changePct;
+  const ip = t.impressions.changePct, pd = t.position.delta;
+
+  if (s != null && s <= -10) {
+    out.push(c != null && c <= -10
+      ? { metric: 'Sessions', text: 'Down, and Search Console clicks fell too, so organic search is the likely driver.', confidence: 'medium' }
+      : { metric: 'Sessions', text: 'Down by more than organic clicks, so the drop is likely from other channels (direct, referral, paid, social) or tracking. Check the GA4 channel report.', confidence: 'low' });
+  } else if (s != null && s >= 10) {
+    out.push(c != null && c >= 10
+      ? { metric: 'Sessions', text: 'Up, and Search Console clicks rose too, so organic search is the likely driver.', confidence: 'medium' }
+      : { metric: 'Sessions', text: 'Up by more than organic clicks, so the rise likely comes from other channels (direct, referral, paid, social). Check the GA4 channel report.', confidence: 'low' });
+  }
+
+  if (c != null && c <= -10) {
+    if (pd != null && pd <= -1) out.push({ metric: 'Clicks', text: 'Down while average position worsened, a likely ranking loss.', confidence: 'medium' });
+    else if (ip != null && ip <= -10) out.push({ metric: 'Clicks', text: 'Down with fewer impressions, likely lower demand or visibility.', confidence: 'medium' });
+    else out.push({ metric: 'Clicks', text: 'Down while impressions and position held, so click-through fell. Possible SERP change, check the live results manually.', confidence: 'low' });
+  } else if (c != null && c >= 10) {
+    if (pd != null && pd >= 1) out.push({ metric: 'Clicks', text: 'Up while average position improved, a likely ranking gain.', confidence: 'medium' });
+    else if (ip != null && ip >= 10) out.push({ metric: 'Clicks', text: 'Up with more impressions, likely higher demand or visibility.', confidence: 'medium' });
+    else out.push({ metric: 'Clicks', text: 'Up while impressions and position held, so click-through improved.', confidence: 'low' });
+  }
+
+  if (t.keyEvents.prev === 0 && t.keyEvents.cur === 0) {
+    out.push({ metric: 'Key events', text: 'None recorded in either period. Check that key events are marked in GA4.', confidence: 'high' });
+  } else if (k != null && k <= -20 && !(s != null && s <= -10)) {
+    out.push({ metric: 'Key events', text: 'Down without a matching traffic drop. Check event tracking and the form or booking flow.', confidence: 'low' });
+  }
+  return out;
+}
+
+const withWhy = (moves, t) =>
+  Object.fromEntries(Object.entries(moves).map(([k, arr]) => [k, arr.map(i => ({ ...i, why: explainItem(i, t) }))]));
+
+// ---------- Comparison (shared by the dashboard route and the weekly digest) ----------
+async function buildComparison(client, query) {
+  const range = resolveRange(query);
+  const t = {
+    position: clampNum(query.positionDelta, 3, 1, 50),
+    clickPct: clampNum(query.clickPct, 20, 1, 100),
+    minClicks: clampNum(query.minClicks, 5, 1, 10000),
+    minImpressions: clampNum(query.minImpressions, 20, 1, 100000),
+  };
+  const blogOnly = query.blogOnly === true || query.blogOnly === 'true';
+
+  const cacheKey = JSON.stringify([client._id, range, t, blogOnly]);
+  const hit = compareCache.get(cacheKey);
+  if (hit && Date.now() - hit.at < COMPARE_CACHE_MS) return hit.body;
+
+  const g = shiftForGsc(range);
+  const [gaCur, gaPrev, gscTotCur, gscTotPrev, qCur, qPrev, pCur, pPrev] = await Promise.all([
+    getGa4Totals(client.ga4PropertyId, range.start, range.end),
+    getGa4Totals(client.ga4PropertyId, range.prevStart, range.prevEnd),
+    gscQuery(client.gscSiteUrl, g.start, g.end),
+    gscQuery(client.gscSiteUrl, g.prevStart, g.prevEnd),
+    gscQuery(client.gscSiteUrl, g.start, g.end, ['query']),
+    gscQuery(client.gscSiteUrl, g.prevStart, g.prevEnd, ['query']),
+    gscQuery(client.gscSiteUrl, g.start, g.end, ['page']),
+    gscQuery(client.gscSiteUrl, g.prevStart, g.prevEnd, ['page']),
+  ]);
+
+  const tot = rows => rows[0] || { clicks: 0, impressions: 0, ctr: 0, position: 0 };
+  const sc = tot(gscTotCur);
+  const sp = tot(gscTotPrev);
+  const metric = (cur, prev) => ({ cur, prev, changePct: pctChange(cur, prev) });
+
+  const totals = {
+    sessions: metric(gaCur.sessions, gaPrev.sessions),
+    users: metric(gaCur.users, gaPrev.users),
+    keyEvents: metric(gaCur.keyEvents, gaPrev.keyEvents),
+    clicks: metric(sc.clicks, sp.clicks),
+    impressions: metric(sc.impressions, sp.impressions),
+    ctr: metric(sc.ctr * 100, sp.ctr * 100),
+    position: {
+      cur: sc.position || null,
+      prev: sp.position || null,
+      delta: sc.position && sp.position ? sp.position - sc.position : null, // positive = improved
+    },
+  };
+
+  const body = {
+    range,
+    gscRange: g,
+    thresholds: { ...t, blogOnly },
+    totals,
+    explanations: explainTotals(totals),
+    queries: withWhy(findMovers(qCur, qPrev, t), t),
+    pages: withWhy(findMovers(pCur, pPrev, t, blogOnly ? key => key.includes('/blog') : () => true), t),
+  };
+
+  if (compareCache.size > 200) compareCache.clear();
+  compareCache.set(cacheKey, { at: Date.now(), body });
+  return body;
+}
+
+app.get('/api/dashboard/:clientId/compare', requireAuth, async (req, res) => {
+  try {
+    if (!mongoose.isValidObjectId(req.params.clientId)) {
+      return res.status(404).json({ message: 'Client not found.' });
+    }
+    const client = await Client.findById(req.params.clientId);
+    if (!client) return res.status(404).json({ message: 'Client not found.' });
+    res.json(await buildComparison(client, req.query));
+  } catch (e) {
+    if (e instanceof HttpError) return res.status(e.status).json({ message: e.message });
+    console.error('Compare failed:', e.message);
+    res.status(500).json({ message: `Comparison failed: ${e.message}` });
+  }
+});
+
+// ---------- Sending: Slack webhook + email (HTTPS API, because Render free blocks SMTP) ----------
+const SLACK_RE = /^https:\/\/hooks\.slack\.com\/services\/[A-Za-z0-9/_-]+$/;
+const EMAIL_RE = /^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/;
+const escapeHtml = s => String(s).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+
+const sendErr = e => {
+  const d = e?.response?.data;
+  if (d) return (typeof d === 'string' ? d : JSON.stringify(d)).slice(0, 300);
+  return String(e?.message || e).slice(0, 300);
+};
+
+async function sendSlack(url, text) {
+  if (!SLACK_RE.test(url)) throw new Error('Slack webhook URL is not valid.');
+  await axios.post(url, { text }, { timeout: 10000, maxRedirects: 0 });
+}
+
+// async function sendEmail({ to, subject, text }) {
+//   const html = `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.5;white-space:pre-wrap">${escapeHtml(text)}</div>`;
+
+//   // Option 1: your Gmail account, through a small Google Apps Script web app (plain HTTPS, so it works on Render free).
+//   if (process.env.GMAIL_SCRIPT_URL) {
+//     if (!process.env.GMAIL_SCRIPT_SECRET) throw new Error('GMAIL_SCRIPT_SECRET is not set on the server.');
+//     const r = await axios.post(
+//       process.env.GMAIL_SCRIPT_URL,
+//       { secret: process.env.GMAIL_SCRIPT_SECRET, to, subject, text, html },
+//       { timeout: 30000 } // Apps Script answers with a redirect; axios follows it
+//     );
+//     if (!r.data || typeof r.data !== 'object' || r.data.ok !== true) {
+//       const why = r.data && typeof r.data === 'object'
+//         ? (r.data.error || 'unknown error')
+//         : 'unexpected reply. Check the web app is deployed with access set to "Anyone".';
+//       throw new Error(`Gmail script: ${why}`);
+//     }
+//     return;
+//   }
+
+//   // Option 2: Resend (needs a verified domain to email other people).
+//   if (!process.env.RESEND_API_KEY || !process.env.EMAIL_FROM) {
+//     throw new Error('Email is not configured on the server (set GMAIL_SCRIPT_URL + GMAIL_SCRIPT_SECRET, or RESEND_API_KEY + EMAIL_FROM).');
+//   }
+//   await axios.post(
+//     'https://api.resend.com/emails',
+//     { from: process.env.EMAIL_FROM, to, subject, text, html },
+//     { headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}` }, timeout: 15000 }
+//   );
+// }
+
+
+async function sendEmail({ to, subject, text }) {
+  const html = `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.5;white-space:pre-wrap">${escapeHtml(text)}</div>`;
+
+  // Option 1: your Gmail account, through a small Google Apps Script web app (plain HTTPS, so it works on Render free).
+  if (process.env.GMAIL_SCRIPT_URL) {
+    if (!process.env.GMAIL_SCRIPT_SECRET) throw new Error('GMAIL_SCRIPT_SECRET is not set on the server.');
+    const r = await axios.post(
+      process.env.GMAIL_SCRIPT_URL,
+      { secret: process.env.GMAIL_SCRIPT_SECRET, to, subject, text, html },
+      { timeout: 30000 } // Apps Script answers with a redirect; axios follows it
+    );
+    if (!r.data || typeof r.data !== 'object' || r.data.ok !== true) {
+      const why = r.data && typeof r.data === 'object'
+        ? (r.data.error || 'unknown error')
+        : 'unexpected reply. Check the web app is deployed with access set to "Anyone".';
+      throw new Error(`Gmail script: ${why}`);
+    }
+    return;
+  }
+
+  // Option 2: Resend (needs a verified domain to email other people).
+  if (!process.env.RESEND_API_KEY || !process.env.EMAIL_FROM) {
+    throw new Error('Email is not configured on the server (set GMAIL_SCRIPT_URL + GMAIL_SCRIPT_SECRET, or RESEND_API_KEY + EMAIL_FROM).');
+  }
+  await axios.post(
+    'https://api.resend.com/emails',
+    { from: process.env.EMAIL_FROM, to, subject, text, html },
+    { headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}` }, timeout: 15000 }
+  );
+}
+
+// ---------- Draft writing (Claude) ----------
+const pathOf = u => { try { const x = new URL(u); return x.pathname + x.search; } catch { return u; } };
+const r1 = n => (n == null ? null : Math.round(n * 10) / 10);
+
+function digestFacts(client, cmp) {
+  const totals = Object.fromEntries(Object.entries(cmp.totals).map(([k, v]) => [
+    k,
+    k === 'position'
+      ? { current: r1(v.cur), previous: r1(v.prev), improvedBy: r1(v.delta) }
+      : { current: r1(v.cur), previous: r1(v.prev), changePct: r1(v.changePct) },
+  ]));
+  const row = (i, isPage) => ({
+    item: isPage ? pathOf(i.key) : i.key,
+    clicks: i.clicks, previousClicks: i.prevClicks,
+    position: r1(i.position), previousPosition: r1(i.prevPosition),
+    likelyCause: i.why.cause, confidence: i.why.confidence,
+  });
+  const top = (arr, isPage) => arr.slice(0, 6).map(i => row(i, isPage));
+  return {
+    client: client.name,
+    period: `${cmp.range.start} to ${cmp.range.end}`,
+    previousPeriod: `${cmp.range.prevStart} to ${cmp.range.prevEnd}`,
+    searchConsoleWindowShiftedEarlierByDays: cmp.gscRange.shiftedDays,
+    totals,
+    likelyCausesForTotals: cmp.explanations,
+    queries: {
+      rankingUp: top(cmp.queries.positionUp), rankingDown: top(cmp.queries.positionDown),
+      gainingClicks: top(cmp.queries.clickWinners), losingClicks: top(cmp.queries.clickLosers),
+    },
+    pages: { gainingClicks: top(cmp.pages.clickWinners, true), losingClicks: top(cmp.pages.clickLosers, true) },
+  };
+}
+
+function parseDigest(text, clientName) {
+  const grab = tag => (text.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`)) || [])[1]?.trim();
+  return {
+    slackText: grab('slack') || text.trim().slice(0, 900),
+    emailSubject: (grab('email_subject') || `${clientName}: weekly SEO update`).slice(0, 200),
+    emailBody: grab('email_body') || text.trim(),
+  };
+}
+
+async function writeDigest(client, cmp) {
+  const facts = digestFacts(client, cmp);
+  const prompt = `You write the weekly SEO update for "${client.name}". Use ONLY the facts in the JSON. Rules:
+- "likelyCause" and "likelyCausesForTotals" are rule-based guesses, not facts. Always call them "likely" or "possible", keep the confidence level, and never add a cause that is not in the JSON.
+- Do not mention AI Overviews or competitors.
+- If a list is empty, say nothing moved past the thresholds there. Do not invent movement.
+- Search Console data lags a few days, so it covers an earlier window than GA4. Mention that once if the shift is above 0.
+- Clicks and impressions are whole numbers. Round other numbers sensibly.
+
+Write three parts in exactly this format:
+<slack>
+For the internal team, in Slack mrkdwn (single *asterisks* for bold, • for bullets), under 900 characters: one headline line, 3 to 5 bullets on the biggest changes, one line on what to check next.
+</slack>
+<email_subject>
+A short, plain subject line.
+</email_subject>
+<email_body>
+For the client contact, plain text with no markdown, 150 to 250 words, friendly and clear: what happened, the likely reasons, and one suggested next step based only on the data. Start with "Hello," and end with "Regards,".
+</email_body>
+
+Facts:
+${JSON.stringify(facts)}`;
+
+  const msg = await anthropic.messages.create({
+    model: 'claude-sonnet-5',
+    max_tokens: 1500,
+    thinking: { type: 'disabled' },
+    messages: [{ role: 'user', content: prompt }],
+  });
+  const text = msg.content.find(b => b.type === 'text')?.text || '';
+  if (!text) throw new Error('Claude returned no text.');
+  return parseDigest(text, client.name);
+}
+
+// ---------- Weekly drafts (safe to call any number of times) ----------
+// Week = Monday to Sunday in IST. One draft per client per week.
+function currentWeekKey() {
+  const ist = new Date(Date.now() + 330 * 60000);
+  const sinceMonday = (ist.getUTCDay() + 6) % 7;
+  return fmtDate(new Date(ist.getTime() - sinceMonday * DAY_MS));
+}
+
+let digestRunning = false;
+
+async function createWeeklyDrafts({ clientId = null, force = false } = {}) {
+  if (digestRunning) return;
+  digestRunning = true;
+  try {
+    const weekKey = currentWeekKey();
+    // Scheduled / bulk runs only cover clients whose weekly report is switched ON.
+    // A run for one named client (testing) works whatever the switch says.
+    const clients = clientId ? await Client.find({ _id: clientId }) : await Client.find({ weeklyReport: true });
+    for (const client of clients) {
+      try {
+        const existing = await Digest.findOne({ clientId: client._id, weekKey });
+        if (existing && (!force || ['sent', 'sending'].includes(existing.status))) continue;
+
+        const cmp = await buildComparison(client, { days: 7 });
+        const text = await writeDigest(client, cmp);
+        await Digest.findOneAndUpdate(
+          { clientId: client._id, weekKey },
+          { $set: { ...text, range: { start: cmp.range.start, end: cmp.range.end }, status: 'draft', delivery: {}, approvedBy: null, sentAt: null } },
+          { upsert: true }
+        );
+        console.log(`Digest draft ready: ${client.name} (${weekKey})`);
+      } catch (e) {
+        console.error(`Digest failed for ${client.name}:`, e.message);
+      }
+    }
+  } finally {
+    digestRunning = false;
+  }
+}
+
+// ---------- Digest + delivery-settings routes (admin only) ----------
+app.get('/api/delivery', requireAuth, requireAdmin, async (req, res) => {
+  const clients = await Client.find().sort({ name: 1 });
+  res.json(clients.map(c => ({
+    id: c._id,
+    name: c.name,
+    weeklyReport: c.weeklyReport === true,
+    emailEnabled: c.emailEnabled !== false,
+    slackEnabled: c.slackEnabled !== false,
+    hasWebhook: !!c.slackWebhookUrl,
+    webhookHint: c.slackWebhookUrl ? `…${c.slackWebhookUrl.slice(-6)}` : '',
+    emailRecipients: c.emailRecipients || [],
+  })));
+});
+
+app.put('/api/clients/:id/delivery', requireAuth, requireAdmin, async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ message: 'Client not found.' });
+  const client = await Client.findById(req.params.id);
+  if (!client) return res.status(404).json({ message: 'Client not found.' });
+
+  const { slackWebhookUrl, emailRecipients, weeklyReport, emailEnabled, slackEnabled } = req.body;
+
+  if (typeof weeklyReport === 'boolean') client.weeklyReport = weeklyReport;
+  if (typeof emailEnabled === 'boolean') client.emailEnabled = emailEnabled;
+  if (typeof slackEnabled === 'boolean') client.slackEnabled = slackEnabled;
+
+  if (typeof slackWebhookUrl === 'string') {
+    const url = slackWebhookUrl.trim();
+    if (url && !SLACK_RE.test(url)) {
+      return res.status(400).json({ message: 'That is not a Slack webhook URL. It should start with https://hooks.slack.com/services/' });
+    }
+    client.slackWebhookUrl = url;
+  }
+
+  if (emailRecipients !== undefined) {
+    const raw = Array.isArray(emailRecipients) ? emailRecipients : String(emailRecipients).split(/[,;\s]+/);
+    const list = [...new Set(raw.map(s => String(s).trim().toLowerCase()).filter(Boolean))];
+    const bad = list.find(e => !EMAIL_RE.test(e));
+    if (bad) return res.status(400).json({ message: `"${bad}" is not a valid email address.` });
+    if (list.length > 10) return res.status(400).json({ message: 'Use 10 email addresses or fewer per client.' });
+    client.emailRecipients = list;
+  }
+
+  const emailReady = client.emailEnabled !== false && (client.emailRecipients?.length || 0) > 0;
+  const slackReady = client.slackEnabled !== false && !!client.slackWebhookUrl;
+  if (client.weeklyReport === true && !emailReady && !slackReady) {
+    return res.status(400).json({ message: 'Add at least one email recipient (with Email on), or a Slack webhook (with Slack on), before turning weekly reports on.' });
+  }
+
+  await client.save();
+  res.json({ status: 'ok' });
+});
+
+app.get('/api/digests', requireAuth, requireAdmin, async (req, res) => {
+  const digests = await Digest.find().sort({ createdAt: -1 }).limit(60).lean();
+  const clients = await Client.find({ _id: { $in: digests.map(d => d.clientId) } }).lean();
+  const byId = new Map(clients.map(c => [String(c._id), c]));
+  res.json(digests.map(d => {
+    const c = byId.get(String(d.clientId));
+    return {
+      id: d._id,
+      clientName: c?.name || 'Deleted client',
+      weekKey: d.weekKey,
+      range: d.range,
+      status: d.status,
+      slackText: d.slackText,
+      emailSubject: d.emailSubject,
+      emailBody: d.emailBody,
+      delivery: d.delivery || {},
+      approvedBy: d.approvedBy,
+      sentAt: d.sentAt,
+      // What a real send would reach right now (switches applied)
+      slackConfigured: c?.slackEnabled !== false && !!c?.slackWebhookUrl,
+      emailCount: c?.emailEnabled !== false ? (c?.emailRecipients?.length || 0) : 0,
+      hasWebhook: !!c?.slackWebhookUrl,
+      weeklyReport: c?.weeklyReport === true,
+      updatedAt: d.updatedAt,
+    };
+  }));
+});
+
+app.patch('/api/digests/:id', requireAuth, requireAdmin, async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ message: 'Digest not found.' });
+  const set = {};
+  const { slackText, emailSubject, emailBody } = req.body;
+  if (typeof slackText === 'string') set.slackText = slackText.slice(0, 4000);
+  if (typeof emailSubject === 'string') set.emailSubject = emailSubject.slice(0, 200);
+  if (typeof emailBody === 'string') set.emailBody = emailBody.slice(0, 10000);
+
+  const d = await Digest.findOneAndUpdate({ _id: req.params.id, status: { $in: ['draft', 'failed'] } }, { $set: set });
+  if (!d) return res.status(409).json({ message: 'Only drafts can be edited.' });
+  res.json({ status: 'ok' });
+});
+
+app.post('/api/digests/:id/discard', requireAuth, requireAdmin, async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ message: 'Digest not found.' });
+  const d = await Digest.findOneAndUpdate({ _id: req.params.id, status: { $in: ['draft', 'failed'] } }, { $set: { status: 'discarded' } });
+  if (!d) return res.status(409).json({ message: 'Only drafts can be discarded.' });
+  res.json({ status: 'ok' });
+});
+
+// Testing: sends a copy to an address you choose (and optionally to the client's Slack channel).
+// Never touches the digest's status, never reaches the client's email recipients.
+app.post('/api/digests/:id/test-send', requireAuth, requireAdmin, async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ message: 'Digest not found.' });
+  const d = await Digest.findById(req.params.id);
+  if (!d) return res.status(404).json({ message: 'Digest not found.' });
+  const client = await Client.findById(d.clientId);
+
+  const email = String(req.body?.email || '').trim().toLowerCase();
+  const wantSlack = req.body?.slack === true;
+  if (!email && !wantSlack) return res.status(400).json({ message: 'Enter a test email address, or tick the Slack option.' });
+  if (email && !EMAIL_RE.test(email)) return res.status(400).json({ message: 'That test email address is not valid.' });
+  if (wantSlack && !client?.slackWebhookUrl) return res.status(400).json({ message: 'This client has no Slack webhook saved.' });
+
+  const [emailRes, slackRes] = await Promise.allSettled([
+    email ? sendEmail({ to: [email], subject: `[TEST] ${d.emailSubject}`, text: `*** TEST: this was not sent to the client ***\n\n${d.emailBody}` }) : Promise.resolve(),
+    wantSlack ? sendSlack(client.slackWebhookUrl, `*[TEST, not the real report]*\n${d.slackText}`) : Promise.resolve(),
+  ]);
+
+  const result = {};
+  if (email) result.email = emailRes.status === 'fulfilled' ? 'sent' : `failed: ${sendErr(emailRes.reason)}`;
+  if (wantSlack) result.slack = slackRes.status === 'fulfilled' ? 'sent' : `failed: ${sendErr(slackRes.reason)}`;
+  res.json(result);
+});
+
+app.post('/api/digests/:id/approve', requireAuth, requireAdmin, async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ message: 'Digest not found.' });
+
+  // Atomic claim, so a double click can never send twice
+  const d = await Digest.findOneAndUpdate(
+    { _id: req.params.id, status: { $in: ['draft', 'failed'] } },
+    { $set: { status: 'sending', approvedBy: req.user.username } }
+  ); // returns the document as it was before the claim
+  if (!d) return res.status(409).json({ message: 'This digest is not waiting for approval (already sent, sending or discarded).' });
+
+  const prevStatus = d.status;
+  const release = (code, message) => Digest.updateOne({ _id: d._id }, { $set: { status: prevStatus } }).then(() => res.status(code).json({ message }));
+
+  const client = await Client.findById(d.clientId);
+  if (!client) return release(404, 'The client for this digest no longer exists.');
+  if (client.weeklyReport !== true) {
+    return release(400, 'Weekly reports are OFF for this client. Turn them on in Delivery settings, or use Send test.');
+  }
+
+  const slackDone = d.delivery?.slack?.status === 'sent';
+  const emailDone = d.delivery?.email?.status === 'sent';
+  const wantSlack = client.slackEnabled !== false && !!client.slackWebhookUrl && !slackDone;
+  const wantEmail = client.emailEnabled !== false && (client.emailRecipients?.length || 0) > 0 && !emailDone;
+  if (!wantSlack && !wantEmail && !slackDone && !emailDone) {
+    return release(400, 'Nothing to send to. Turn on Email (with recipients) or Slack (with a webhook) in Delivery settings.');
+  }
+
+  const [slackRes, emailRes] = await Promise.allSettled([
+    wantSlack ? sendSlack(client.slackWebhookUrl, d.slackText) : Promise.resolve(),
+    wantEmail ? sendEmail({ to: client.emailRecipients, subject: d.emailSubject, text: d.emailBody }) : Promise.resolve(),
+  ]);
+
+  const set = {};
+  const record = (name, wanted, r) => {
+    if (!wanted) return;
+    set[`delivery.${name}.status`] = r.status === 'fulfilled' ? 'sent' : 'failed';
+    set[`delivery.${name}.error`] = r.status === 'rejected' ? sendErr(r.reason) : '';
+    set[`delivery.${name}.at`] = new Date();
+  };
+  record('slack', wantSlack, slackRes);
+  record('email', wantEmail, emailRes);
+
+  const failed = (wantSlack && slackRes.status === 'rejected') || (wantEmail && emailRes.status === 'rejected');
+  set.status = failed ? 'failed' : 'sent';
+  if (!failed) set.sentAt = new Date();
+  await Digest.updateOne({ _id: d._id }, { $set: set });
+
+  res.json({ status: set.status });
+});
+
+app.post('/api/digests/generate', requireAuth, requireAdmin, (req, res) => {
+  if (digestRunning) return res.status(409).json({ message: 'A run is already in progress. Give it a minute, then refresh.' });
+  const clientId = mongoose.isValidObjectId(req.body?.clientId) ? req.body.clientId : null;
+  createWeeklyDrafts({ clientId, force: req.body?.force === true }).catch(e => console.error('Digest run failed:', e.message));
+  res.status(202).json({ status: 'started' });
+});
+
+// Called by an external scheduler (see setup notes). Secret goes in a header, never the URL.
+app.post('/api/cron/weekly-digest', (req, res) => {
+  const secret = process.env.CRON_SECRET || '';
+  const given = String(req.headers['x-cron-secret'] || '');
+  const ok = secret.length >= 16 && given.length === secret.length &&
+    crypto.timingSafeEqual(Buffer.from(given), Buffer.from(secret));
+  if (!ok) return res.status(401).json({ message: 'Unauthorized.' });
+  res.status(202).json({ status: 'started', weekKey: currentWeekKey() });
+  createWeeklyDrafts().catch(e => console.error('Weekly digest run failed:', e.message));
+});
+
+// Backup triggers: Monday 08:00 IST if the server happens to be awake, and a catch-up
+// shortly after every boot (Render wakes the service, this fills in any missing draft).
+cron.schedule('0 8 * * 1', () => {
+  createWeeklyDrafts().catch(e => console.error('Weekly digest run failed:', e.message));
+}, { timezone: 'Asia/Kolkata' });
+setTimeout(() => {
+  createWeeklyDrafts().catch(e => console.error('Digest catch-up failed:', e.message));
+}, 30 * 1000);
+
+
 
 // ---------- ROUTES ----------
 
