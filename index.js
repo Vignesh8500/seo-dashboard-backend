@@ -413,7 +413,11 @@ async function requireAuth(req, res, next) {
     const payload = jwt.verify(token, process.env.JWT_SECRET);
     const user = await User.findById(payload.id);
     if (!user) return res.status(401).json({ message: 'Account no longer exists.' });
-    req.user = { id: user._id.toString(), username: user.username, role: user.role };
+    req.user = {
+  id: user._id.toString(), username: user.username, role: user.role,
+  allClients: user.role === 'admin' || user.allClients !== false,
+  clientIds: (user.clientIds || []).map(String),
+};
     next();
   } catch {
     return res.status(401).json({ message: 'Session expired. Please log in again.' });
@@ -423,6 +427,17 @@ async function requireAuth(req, res, next) {
 function requireAdmin(req, res, next) {
   if (req.user?.role !== 'admin') {
     return res.status(403).json({ message: 'Admin access required.' });
+  }
+  next();
+}
+
+function canAccessClient(user, clientId) {
+  return user.allClients || user.clientIds.includes(String(clientId));
+}
+
+function requireClientAccess(req, res, next) {
+  if (!canAccessClient(req.user, req.params.clientId)) {
+    return res.status(403).json({ message: 'You do not have access to this client.' });
   }
   next();
 }
@@ -450,7 +465,11 @@ app.get('/api/auth/me', requireAuth, (req, res) => {
 
 app.get('/api/users', requireAuth, requireAdmin, async (req, res) => {
   const users = await User.find().sort({ createdAt: 1 });
-  res.json(users.map(u => ({ id: u._id, username: u.username, role: u.role, createdAt: u.createdAt })));
+  res.json(users.map(u => ({
+  id: u._id, username: u.username, role: u.role, createdAt: u.createdAt,
+  allClients: u.role === 'admin' || u.allClients !== false,
+  clientIds: (u.clientIds || []).map(String),
+})));
 });
 
 app.post('/api/users', requireAuth, requireAdmin, async (req, res) => {
@@ -462,7 +481,13 @@ app.post('/api/users', requireAuth, requireAdmin, async (req, res) => {
   if (password.length < 8) return res.status(400).json({ message: 'Password must be at least 8 characters.' });
   if (await User.findOne({ username })) return res.status(409).json({ message: 'That username is already taken.' });
 
-  const user = await User.create({ username, passwordHash: await bcrypt.hash(password, 12), role });
+  const user = await User.create({
+  username,
+  passwordHash: await bcrypt.hash(password, 12),
+  role,
+  allClients: role === 'admin', // new regular users start with no clients until you assign them
+  clientIds: [],
+});
   res.json({ id: user._id, username: user.username, role: user.role });
 });
 
@@ -483,6 +508,24 @@ app.delete('/api/users/:id', requireAuth, requireAdmin, async (req, res) => {
   if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ message: 'User not found.' });
   if (req.params.id === req.user.id) return res.status(400).json({ message: "You can't delete your own account." });
   await User.findByIdAndDelete(req.params.id);
+  res.json({ status: 'ok' });
+});
+
+app.put('/api/users/:id/access', requireAuth, requireAdmin, async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ message: 'User not found.' });
+  const user = await User.findById(req.params.id);
+  if (!user) return res.status(404).json({ message: 'User not found.' });
+  if (user.role === 'admin') return res.status(400).json({ message: 'Admins can already view every client.' });
+
+  const ids = Array.isArray(req.body.clientIds) ? [...new Set(req.body.clientIds.map(String))] : [];
+  if (!ids.every(id => mongoose.isValidObjectId(id))) return res.status(400).json({ message: 'Invalid client selection.' });
+  if (ids.length && (await Client.countDocuments({ _id: { $in: ids } })) !== ids.length) {
+    return res.status(400).json({ message: 'One of the selected clients no longer exists.' });
+  }
+
+  user.allClients = req.body.allClients === true;
+  user.clientIds = ids;
+  await user.save();
   res.json({ status: 'ok' });
 });
 
@@ -862,7 +905,7 @@ async function buildComparison(client, query) {
   return body;
 }
 
-app.get('/api/dashboard/:clientId/compare', requireAuth, async (req, res) => {
+app.get('/api/dashboard/:clientId/compare', requireAuth, requireClientAccess, async (req, res) => {
   try {
     if (!mongoose.isValidObjectId(req.params.clientId)) {
       return res.status(404).json({ message: 'Client not found.' });
@@ -990,11 +1033,16 @@ function digestFacts(client, cmp) {
 }
 
 function parseDigest(text, clientName) {
-  const grab = tag => (text.match(new RegExp(`<${tag}>([\\s\\S]*?)</${tag}>`)) || [])[1]?.trim();
+  // Reads <tag>…</tag>. If the closing tag is missing (reply cut off), reads up to the next tag or the end.
+  const grab = tag => {
+    const m = text.match(new RegExp(`<${tag}>([\\s\\S]*?)(?:</${tag}>|(?=<(?:slack|email_subject|email_body)>)|$)`));
+    return m ? m[1] : '';
+  };
+  const clean = s => s.replace(/<\/?(?:slack|email_subject|email_body)>/g, '').trim();
   return {
-    slackText: grab('slack') || text.trim().slice(0, 900),
-    emailSubject: (grab('email_subject') || `${clientName}: weekly SEO update`).slice(0, 200),
-    emailBody: grab('email_body') || text.trim(),
+    slackText: clean(grab('slack')) || clean(text).slice(0, 900),
+    emailSubject: (clean(grab('email_subject')) || `${clientName}: weekly SEO update`).slice(0, 200),
+    emailBody: clean(grab('email_body')) || 'The email text was not generated. Click "Generate fresh draft now" to try again.',
   };
 }
 
@@ -1023,7 +1071,7 @@ ${JSON.stringify(facts)}`;
 
   const msg = await anthropic.messages.create({
     model: 'claude-sonnet-5',
-    max_tokens: 1500,
+    max_tokens: 2500,
     thinking: { type: 'disabled' },
     messages: [{ role: 'user', content: prompt }],
   });
@@ -1151,6 +1199,13 @@ app.get('/api/digests', requireAuth, requireAdmin, async (req, res) => {
       updatedAt: d.updatedAt,
     };
   }));
+});
+
+app.delete('/api/digests/:id', requireAuth, requireAdmin, async (req, res) => {
+  if (!mongoose.isValidObjectId(req.params.id)) return res.status(404).json({ message: 'Digest not found.' });
+  const d = await Digest.findOneAndDelete({ _id: req.params.id, status: 'discarded' });
+  if (!d) return res.status(409).json({ message: 'Only discarded drafts can be deleted.' });
+  res.json({ status: 'ok' });
 });
 
 app.patch('/api/digests/:id', requireAuth, requireAdmin, async (req, res) => {
@@ -1283,7 +1338,8 @@ setTimeout(() => {
 
 // The frontend expects `id`, so map Mongo's _id to it
 app.get('/api/clients', requireAuth, async (req, res) => {
-  const clients = await Client.find().sort({ name: 1 });
+  const filter = req.user.allClients ? {} : { _id: { $in: req.user.clientIds } };
+  const clients = await Client.find(filter).sort({ name: 1 });
   res.json(clients.map(c => ({ id: c._id, name: c.name, status: c.status })));
 });
 
@@ -1325,7 +1381,7 @@ app.post('/api/clients', requireAuth, requireAdmin, async (req, res) => {
   res.json({ id: client._id });
 });
 
-app.get('/api/dashboard/:clientId', requireAuth, async (req, res) => {
+app.get('/api/dashboard/:clientId', requireAuth, requireClientAccess, async (req, res) => {
   if (!mongoose.isValidObjectId(req.params.clientId)) {
     return res.status(404).json({ message: 'Client not found.' });
   }
@@ -1343,7 +1399,7 @@ app.get('/api/dashboard/:clientId', requireAuth, async (req, res) => {
   });
 });
 
-app.post('/api/dashboard/:clientId/refresh', requireAuth, async (req, res) => {
+app.post('/api/dashboard/:clientId/refresh', requireAuth, requireClientAccess, async (req, res) => {
   if (!mongoose.isValidObjectId(req.params.clientId)) {
     return res.status(404).json({ message: 'Client not found.' });
   }
@@ -1358,7 +1414,7 @@ app.post('/api/dashboard/:clientId/refresh', requireAuth, async (req, res) => {
   }
 });
 
-app.post('/api/dashboard/:clientId/ask', requireAuth, async (req, res) => {
+app.post('/api/dashboard/:clientId/ask', requireAuth, requireClientAccess, async (req, res) => {
   const { question } = req.body;
   if (!question || !question.trim()) {
     return res.status(400).json({ message: 'Question cannot be empty.' });
@@ -1397,6 +1453,7 @@ app.delete('/api/clients/:id', requireAuth, requireAdmin, async (req, res) => {
   }
   await Snapshot.deleteOne({ clientId: req.params.id });
   await Client.findByIdAndDelete(req.params.id);
+  await User.updateMany({}, { $pull: { clientIds: req.params.id } });
   res.json({ status: 'ok' });
 });
 

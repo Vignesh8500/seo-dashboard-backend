@@ -21,6 +21,8 @@ const userSchema = new mongoose.Schema({
   username: { type: String, required: true, unique: true, lowercase: true, trim: true },
   passwordHash: { type: String, required: true },
   role: { type: String, enum: ['admin', 'user'], default: 'user' },
+  allClients: { type: Boolean, default: true },
+clientIds: { type: [mongoose.Schema.Types.ObjectId], default: [] },
 }, { timestamps: true });
 
 const Client = mongoose.model('Client', clientSchema);
