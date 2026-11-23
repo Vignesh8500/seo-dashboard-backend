@@ -967,16 +967,92 @@ async function sendSlack(url, text) {
 //   );
 // }
 
+// Microsoft 365 (Microsoft Graph, app-only). The token is cached until shortly before it expires.
+let msToken = { value: null, exp: 0 };
+async function getMsToken() {
+  if (msToken.value && Date.now() < msToken.exp - 60000) return msToken.value;
+  const { MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET } = process.env;
+  const r = await axios.post(
+    `https://login.microsoftonline.com/${encodeURIComponent(MS_TENANT_ID)}/oauth2/v2.0/token`,
+    new URLSearchParams({
+      client_id: MS_CLIENT_ID,
+      client_secret: MS_CLIENT_SECRET,
+      scope: 'https://graph.microsoft.com/.default',
+      grant_type: 'client_credentials',
+    }).toString(),
+    { headers: { 'Content-Type': 'application/x-www-form-urlencoded' }, timeout: 15000 }
+  );
+  msToken = { value: r.data.access_token, exp: Date.now() + r.data.expires_in * 1000 };
+  return msToken.value;
+}
+
+
+// async function sendEmail({ to, subject, text }) {
+
+//   const html = `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.5;white-space:pre-wrap">${escapeHtml(text)}</div>`;
+
+//   // Option 1: your Gmail account, through a small Google Apps Script web app (plain HTTPS, so it works on Render free).
+//   if (process.env.GMAIL_SCRIPT_URL) {
+//     if (!process.env.GMAIL_SCRIPT_SECRET) throw new Error('GMAIL_SCRIPT_SECRET is not set on the server.');
+//     const r = await axios.post(
+//       process.env.GMAIL_SCRIPT_URL,
+//       { secret: process.env.GMAIL_SCRIPT_SECRET, to, subject, text, html },
+//       { timeout: 30000 } // Apps Script answers with a redirect; axios follows it
+//     );
+//     if (!r.data || typeof r.data !== 'object' || r.data.ok !== true) {
+//       const why = r.data && typeof r.data === 'object'
+//         ? (r.data.error || 'unknown error')
+//         : 'unexpected reply. Check the web app is deployed with access set to "Anyone".';
+//       throw new Error(`Gmail script: ${why}`);
+//     }
+//     return;
+//   }
+
+//   // Option 2: Resend (needs a verified domain to email other people).
+//   if (!process.env.RESEND_API_KEY || !process.env.EMAIL_FROM) {
+//     throw new Error('Email is not configured on the server (set GMAIL_SCRIPT_URL + GMAIL_SCRIPT_SECRET, or RESEND_API_KEY + EMAIL_FROM).');
+//   }
+//   await axios.post(
+//     'https://api.resend.com/emails',
+//     { from: process.env.EMAIL_FROM, to, subject, text, html },
+//     { headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}` }, timeout: 15000 }
+//   );
+// }
+
 
 async function sendEmail({ to, subject, text }) {
-  const html = `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.5;white-space:pre-wrap">${escapeHtml(text)}</div>`;
+  // <br> instead of white-space:pre-wrap, because Outlook ignores pre-wrap and would run the lines together
+  const html = `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.5">${escapeHtml(text).replace(/\r?\n/g, '<br>')}</div>`;
+  const recipients = [].concat(to);
 
-  // Option 1: your Gmail account, through a small Google Apps Script web app (plain HTTPS, so it works on Render free).
+  // Option 1: Microsoft 365 mailbox through Microsoft Graph (plain HTTPS, so it works on Render free).
+  if (process.env.MS_CLIENT_ID) {
+    const sender = process.env.MS_SENDER_EMAIL;
+    if (!process.env.MS_TENANT_ID || !process.env.MS_CLIENT_SECRET || !sender) {
+      throw new Error('Microsoft 365 email is not fully set up (need MS_TENANT_ID, MS_CLIENT_ID, MS_CLIENT_SECRET, MS_SENDER_EMAIL).');
+    }
+    const token = await getMsToken();
+    await axios.post(
+      `https://graph.microsoft.com/v1.0/users/${encodeURIComponent(sender)}/sendMail`,
+      {
+        message: {
+          subject,
+          body: { contentType: 'HTML', content: html },
+          toRecipients: recipients.map(address => ({ emailAddress: { address } })),
+        },
+        saveToSentItems: true,
+      },
+      { headers: { Authorization: `Bearer ${token}` }, timeout: 20000 }
+    );
+    return;
+  }
+
+  // Option 2: a Gmail account, through a small Google Apps Script web app.
   if (process.env.GMAIL_SCRIPT_URL) {
     if (!process.env.GMAIL_SCRIPT_SECRET) throw new Error('GMAIL_SCRIPT_SECRET is not set on the server.');
     const r = await axios.post(
       process.env.GMAIL_SCRIPT_URL,
-      { secret: process.env.GMAIL_SCRIPT_SECRET, to, subject, text, html },
+      { secret: process.env.GMAIL_SCRIPT_SECRET, to: recipients, subject, text, html },
       { timeout: 30000 } // Apps Script answers with a redirect; axios follows it
     );
     if (!r.data || typeof r.data !== 'object' || r.data.ok !== true) {
@@ -988,13 +1064,13 @@ async function sendEmail({ to, subject, text }) {
     return;
   }
 
-  // Option 2: Resend (needs a verified domain to email other people).
+  // Option 3: Resend (needs a verified domain to email other people).
   if (!process.env.RESEND_API_KEY || !process.env.EMAIL_FROM) {
-    throw new Error('Email is not configured on the server (set GMAIL_SCRIPT_URL + GMAIL_SCRIPT_SECRET, or RESEND_API_KEY + EMAIL_FROM).');
+    throw new Error('Email is not configured on the server (set the MS_* variables, or GMAIL_SCRIPT_URL + GMAIL_SCRIPT_SECRET, or RESEND_API_KEY + EMAIL_FROM).');
   }
   await axios.post(
     'https://api.resend.com/emails',
-    { from: process.env.EMAIL_FROM, to, subject, text, html },
+    { from: process.env.EMAIL_FROM, to: recipients, subject, text, html },
     { headers: { Authorization: `Bearer ${process.env.RESEND_API_KEY}` }, timeout: 15000 }
   );
 }
@@ -1303,9 +1379,12 @@ app.post('/api/digests/:id/approve', requireAuth, requireAdmin, async (req, res)
   res.json({ status: set.status });
 });
 
-app.post('/api/digests/generate', requireAuth, requireAdmin, (req, res) => {
+app.post('/api/digests/generate', requireAuth, requireAdmin, async (req, res) => {
   if (digestRunning) return res.status(409).json({ message: 'A run is already in progress. Give it a minute, then refresh.' });
   const clientId = mongoose.isValidObjectId(req.body?.clientId) ? req.body.clientId : null;
+  if (!clientId && (await Client.countDocuments({ weeklyReport: true })) === 0) {
+    return res.status(400).json({ message: 'No clients have weekly reports ON. Pick a specific client, or switch one ON in Delivery settings.' });
+  }
   createWeeklyDrafts({ clientId, force: req.body?.force === true }).catch(e => console.error('Digest run failed:', e.message));
   res.status(202).json({ status: 'started' });
 });
