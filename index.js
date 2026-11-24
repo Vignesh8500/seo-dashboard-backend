@@ -871,6 +871,13 @@ async function buildComparison(client, query) {
     gscQuery(client.gscSiteUrl, g.prevStart, g.prevEnd, ['page']),
   ]);
 
+
+    // LinkedIn traffic from GA4. A failure here must never break the comparison.
+  const [liCur, liPrev] = await Promise.all([
+    getLinkedInTraffic(client.ga4PropertyId, range.start, range.end),
+    getLinkedInTraffic(client.ga4PropertyId, range.prevStart, range.prevEnd),
+  ]).catch(e => { console.error('LinkedIn report failed:', e.message); return [null, null]; });
+
   const tot = rows => rows[0] || { clicks: 0, impressions: 0, ctr: 0, position: 0 };
   const sc = tot(gscTotCur);
   const sp = tot(gscTotPrev);
@@ -896,6 +903,7 @@ async function buildComparison(client, query) {
     thresholds: { ...t, blogOnly },
     totals,
     explanations: explainTotals(totals),
+    linkedin: buildLinkedIn(liCur, liPrev),
     queries: withWhy(findMovers(qCur, qPrev, t), t),
     pages: withWhy(findMovers(pCur, pPrev, t, blogOnly ? key => key.includes('/blog') : () => true), t),
   };
@@ -1022,7 +1030,8 @@ async function getMsToken() {
 
 async function sendEmail({ to, subject, text }) {
   // <br> instead of white-space:pre-wrap, because Outlook ignores pre-wrap and would run the lines together
-  const html = `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.5">${escapeHtml(text).replace(/\r?\n/g, '<br>')}</div>`;
+  //const html = `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.5">${escapeHtml(text).replace(/\r?\n/g, '<br>')}</div>`;
+    const html = textToHtml(text);
   const recipients = [].concat(to);
 
   // Option 1: Microsoft 365 mailbox through Microsoft Graph (plain HTTPS, so it works on Render free).
@@ -1075,6 +1084,236 @@ async function sendEmail({ to, subject, text }) {
   );
 }
 
+
+
+// ---------- Email layout, dashboard-login footer, LinkedIn ----------
+const n0 = v => Math.round(Number(v) || 0).toLocaleString('en-US');
+const pctTxt = p => (p == null ? 'new' : `${p > 0 ? '+' : ''}${p.toFixed(1)}%`);
+const mmss = sec => { const t = Math.round(sec || 0); return `${Math.floor(t / 60)}:${String(t % 60).padStart(2, '0')}`; };
+const dayTxt = s => new Date(`${s}T00:00:00Z`).toLocaleDateString('en-US', { month: 'short', day: 'numeric', timeZone: 'UTC' });
+
+// Turns the plain-text email into a tidy HTML email: ALL-CAPS lines become headings, "• " lines become bullets, URLs become links.
+function textToHtml(text) {
+  const link = s => s.replace(/(https?:\/\/[^\s<>"']+)/g, '<a href="$1" style="color:#2563eb">$1</a>');
+  const body = String(text).split(/\r?\n/).map(raw => {
+    const trimmed = raw.trim();
+    const line = escapeHtml(trimmed);
+    if (!trimmed) return '<div style="height:10px"></div>';
+    if (/^[A-Z][A-Z0-9 &'()\/,.\-–—]{2,48}$/.test(trimmed)) {
+      return `<div style="margin:20px 0 6px;padding-bottom:4px;border-bottom:1px solid #e5e7eb;font-weight:700;font-size:13px;letter-spacing:0.04em;color:#111827">${line}</div>`;
+    }
+    if (line.startsWith('• ')) return `<div style="margin:3px 0;padding-left:16px;text-indent:-12px">${link(line)}</div>`;
+    return `<div style="margin:3px 0">${link(line)}</div>`;
+  }).join('');
+  return `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.55;color:#1f2937;max-width:640px">${body}</div>`;
+}
+
+// Saved dashboard passwords are encrypted at rest. CREDENTIAL_KEY must be set on the server.
+const credKey = () => crypto.createHash('sha256').update(String(process.env.CREDENTIAL_KEY || '')).digest();
+function encryptSecret(plain) {
+  if (String(process.env.CREDENTIAL_KEY || '').length < 16) throw new Error('Set CREDENTIAL_KEY (16+ characters) on the server before saving a dashboard password.');
+  const iv = crypto.randomBytes(12);
+  const c = crypto.createCipheriv('aes-256-gcm', credKey(), iv);
+  const enc = Buffer.concat([c.update(plain, 'utf8'), c.final()]);
+  return [iv, c.getAuthTag(), enc].map(b => b.toString('base64')).join('.');
+}
+function decryptSecret(packed) {
+  try {
+    const [iv, tag, enc] = packed.split('.').map(x => Buffer.from(x, 'base64'));
+    const d = crypto.createDecipheriv('aes-256-gcm', credKey(), iv);
+    d.setAuthTag(tag);
+    return Buffer.concat([d.update(enc), d.final()]).toString('utf8');
+  } catch {
+    throw new Error('The saved dashboard password could not be read. Enter it again in Delivery settings.');
+  }
+}
+
+// Added at send time, so the link, login and sign-off never sit in the saved draft.
+function emailFooter(client, { masked = false } = {}) {
+  const url = clean(process.env.DASHBOARD_URL);
+  const user = String(client.loginUsername || '').trim();
+  const hasPw = !!client.loginPasswordEnc;
+  if (!url && !user && !hasPw) return '';
+  const lines = ['DASHBOARD ACCESS'];
+  if (url) lines.push(`For more information, visit the SEO Dashboard: ${url}`);
+  if (user) lines.push(`Username: ${user}`);
+  if (hasPw) lines.push(`Password: ${masked ? '(shown in the real email)' : decryptSecret(client.loginPasswordEnc)}`);
+  return lines.join('\n');
+}
+
+function finalEmailText(client, body, opts) {
+  const text = String(body || '').trimEnd();
+  const signedAlready = /(regards|sincerely|thanks),?\s*$/i.test(text);
+  const signOff = signedAlready ? '' : `Regards,\n${clean(process.env.EMAIL_SIGNATURE) || 'SEO Team'}`;
+  return [text, emailFooter(client, opts), signOff].filter(Boolean).join('\n\n');
+}
+
+// LinkedIn visits: any session whose source contains "linkedin" or "lnkd" (linkedin.com, lnkd.in, utm_source=linkedin ...)
+async function getLinkedInTraffic(propertyId, start, end) {
+  const filter = {
+    orGroup: {
+      expressions: ['linkedin', 'lnkd'].map(value => ({
+        filter: { fieldName: 'sessionSource', stringFilter: { matchType: 'CONTAINS', value, caseSensitive: false } },
+      })),
+    },
+  };
+  const metrics = ['sessions', 'totalUsers', 'engagedSessions', 'keyEvents', 'userEngagementDuration'].map(name => ({ name }));
+  const num = (row, i) => Number(row.metricValues?.[i]?.value || 0);
+
+  const [[byCampaign], [totalResp]] = await Promise.all([
+    analyticsClient.runReport({
+      property: `properties/${propertyId}`,
+      dateRanges: [{ startDate: start, endDate: end }],
+      dimensions: [{ name: 'sessionCampaignName' }, { name: 'sessionMedium' }],
+      metrics,
+      dimensionFilter: filter,
+      limit: 100,
+    }).then(r => [r[0]]),
+    analyticsClient.runReport({
+      property: `properties/${propertyId}`,
+      dateRanges: [{ startDate: start, endDate: end }],
+      metrics,
+      dimensionFilter: filter,
+    }).then(r => [r[0]]),
+  ]);
+
+  const parse = row => ({ sessions: num(row, 0), users: num(row, 1), engagedSessions: num(row, 2), keyEvents: num(row, 3), engagementSeconds: num(row, 4) });
+  const rows = (byCampaign.rows || []).map(r => ({
+    campaign: r.dimensionValues[0].value,
+    medium: r.dimensionValues[1].value,
+    ...parse(r),
+  }));
+  const totalRow = totalResp.rows?.[0];
+  const total = totalRow ? parse(totalRow) : { sessions: 0, users: 0, engagedSessions: 0, keyEvents: 0, engagementSeconds: 0 };
+  return { rows, total };
+}
+
+function groupLinkedIn(rows) {
+  const campaigns = new Map();
+  let untaggedSessions = 0;
+  for (const r of rows) {
+    if (r.campaign.startsWith('(')) { untaggedSessions += r.sessions; continue; } // (not set), (direct), (referral) ...
+    const c = campaigns.get(r.campaign) || { name: r.campaign, mediums: new Set(), sessions: 0, users: 0, engagedSessions: 0, keyEvents: 0, engagementSeconds: 0 };
+    c.mediums.add(r.medium);
+    c.sessions += r.sessions; c.users += r.users; c.engagedSessions += r.engagedSessions;
+    c.keyEvents += r.keyEvents; c.engagementSeconds += r.engagementSeconds;
+    campaigns.set(r.campaign, c);
+  }
+  return { campaigns, untaggedSessions };
+}
+
+function buildLinkedIn(cur, prev) {
+  if (!cur) return null;
+  if (cur.total.sessions === 0 && (prev?.total?.sessions || 0) === 0) return null; // no LinkedIn traffic at all: skip the section
+  const c = groupLinkedIn(cur.rows);
+  const p = groupLinkedIn(prev?.rows || []);
+  const campaigns = [...c.campaigns.values()]
+    .sort((a, b) => b.sessions - a.sessions)
+    .slice(0, 8)
+    .map(x => {
+      const before = p.campaigns.get(x.name)?.sessions || 0;
+      return {
+        name: x.name,
+        mediums: [...x.mediums].filter(m => m !== '(not set)'),
+        sessions: x.sessions, users: x.users, keyEvents: x.keyEvents,
+        engagementRate: x.sessions ? Math.round((x.engagedSessions / x.sessions) * 100) : 0,
+        avgEngagementSeconds: x.sessions ? x.engagementSeconds / x.sessions : 0,
+        prevSessions: before,
+        sessionsChangePct: pctChange(x.sessions, before),
+      };
+    });
+  return {
+    total: cur.total,
+    prevTotal: prev?.total || { sessions: 0, users: 0, engagedSessions: 0, keyEvents: 0, engagementSeconds: 0 },
+    campaigns,
+    untaggedSessions: c.untaggedSessions,
+  };
+}
+
+function linkedinLines(li) {
+  const t = li.total;
+  const rate = t.sessions ? Math.round((t.engagedSessions / t.sessions) * 100) : 0;
+  const lines = [`Total LinkedIn visits: ${n0(t.sessions)} sessions (${pctTxt(pctChange(t.sessions, li.prevTotal.sessions))}) · ${n0(t.users)} users · ${rate}% engaged · ${n0(t.keyEvents)} key events`];
+  for (const c of li.campaigns) {
+    const med = c.mediums.length ? ` (${c.mediums.join(', ')})` : '';
+    lines.push(`• ${c.name}${med}: ${n0(c.sessions)} sessions (${pctTxt(c.sessionsChangePct)}) · ${n0(c.users)} users · ${c.engagementRate}% engaged · avg ${mmss(c.avgEngagementSeconds)} on site · ${n0(c.keyEvents)} key events`);
+  }
+  if (li.untaggedSessions > 0) {
+    lines.push(li.campaigns.length
+      ? `• Other LinkedIn visits (no campaign name): ${n0(li.untaggedSessions)} sessions`
+      : 'None of these visits carry a campaign name, so results cannot be split by campaign yet.');
+  }
+  return lines;
+}
+
+function linkedinFacts(li) {
+  if (!li) return null;
+  const t = li.total;
+  return {
+    sessions: t.sessions, previousSessions: li.prevTotal.sessions, sessionsChangePct: r1(pctChange(t.sessions, li.prevTotal.sessions)),
+    users: t.users, engagedPct: t.sessions ? Math.round((t.engagedSessions / t.sessions) * 100) : 0, keyEvents: t.keyEvents,
+    campaigns: li.campaigns.slice(0, 6).map(c => ({
+      name: c.name, sessions: c.sessions, previousSessions: c.prevSessions, users: c.users,
+      engagedPct: c.engagementRate, keyEvents: c.keyEvents,
+    })),
+    visitsWithoutCampaignName: li.untaggedSessions,
+  };
+}
+
+function periodLine(cmp) {
+  const r = cmp.range, g = cmp.gscRange;
+  let s = `Period: ${dayTxt(r.start)} to ${dayTxt(r.end)}, compared with ${dayTxt(r.prevStart)} to ${dayTxt(r.prevEnd)}.`;
+  if (g && g.shiftedDays > 0) s += ` Search figures cover ${dayTxt(g.start)} to ${dayTxt(g.end)}, because Google reports search data a few days late.`;
+  return s;
+}
+
+function keyNumberLines(cmp) {
+  const t = cmp.totals;
+  const line = (label, m, fmt = n0) => `• ${label}: ${fmt(m.cur)} (${pctTxt(m.changePct)})`;
+  const pos = t.position;
+  const posTxt = pos.cur == null ? 'n/a'
+    : `${pos.cur.toFixed(1)} (${pos.delta == null || Math.abs(pos.delta) < 0.05 ? 'unchanged' : pos.delta > 0 ? `improved by ${pos.delta.toFixed(1)}` : `dropped by ${Math.abs(pos.delta).toFixed(1)}`})`;
+  return [
+    line('Website sessions', t.sessions),
+    line('Website users', t.users),
+    line('Key events (goals)', t.keyEvents),
+    line('Search clicks', t.clicks),
+    line('Search impressions', t.impressions),
+    line('Click-through rate', t.ctr, v => `${v.toFixed(1)}%`),
+    `• Average search position: ${posTxt}`,
+  ];
+}
+
+function fallbackChanges(cmp) {
+  const out = [];
+  const add = (label, arr, isPage) => arr.slice(0, 3).forEach(i => out.push(`• ${label}: ${isPage ? pathOf(i.key) : i.key} (${n0(i.prevClicks)} to ${n0(i.clicks)} clicks)`));
+  add('Gained clicks', cmp.queries.clickWinners, false);
+  add('Lost clicks', cmp.queries.clickLosers, false);
+  add('Page gaining clicks', cmp.pages.clickWinners, true);
+  add('Page losing clicks', cmp.pages.clickLosers, true);
+  return out.length ? out.join('\n') : '• No search term or page moved past our alert thresholds this week.';
+}
+
+// Numbers and tables come from code (always correct); Claude only writes the short explanations.
+function assembleEmail(client, cmp, p) {
+  const out = [
+    'Hello,', '',
+    p.summary || `Here is your weekly SEO update for ${client.name}.`, '',
+    periodLine(cmp), '',
+    'KEY NUMBERS', ...keyNumberLines(cmp), '',
+    'WHAT CHANGED IN SEARCH', p.changes || fallbackChanges(cmp), '',
+  ];
+  if (cmp.linkedin) {
+    out.push('LINKEDIN CAMPAIGNS');
+    if (p.linkedin) out.push(p.linkedin);
+    out.push(...linkedinLines(cmp.linkedin), '');
+  }
+  if (p.next) out.push('NEXT STEPS', p.next, '');
+  return out.join('\n').trimEnd();
+}
+
+
+
 // ---------- Draft writing (Claude) ----------
 const pathOf = u => { try { const x = new URL(u); return x.pathname + x.search; } catch { return u; } };
 const r1 = n => (n == null ? null : Math.round(n * 10) / 10);
@@ -1105,42 +1344,113 @@ function digestFacts(client, cmp) {
       gainingClicks: top(cmp.queries.clickWinners), losingClicks: top(cmp.queries.clickLosers),
     },
     pages: { gainingClicks: top(cmp.pages.clickWinners, true), losingClicks: top(cmp.pages.clickLosers, true) },
+
+        linkedin: linkedinFacts(cmp.linkedin),
   };
 }
 
+// function parseDigest(text, clientName) {
+//   // Reads <tag>…</tag>. If the closing tag is missing (reply cut off), reads up to the next tag or the end.
+//   const grab = tag => {
+//     const m = text.match(new RegExp(`<${tag}>([\\s\\S]*?)(?:</${tag}>|(?=<(?:slack|email_subject|email_body)>)|$)`));
+//     return m ? m[1] : '';
+//   };
+//   const clean = s => s.replace(/<\/?(?:slack|email_subject|email_body)>/g, '').trim();
+//   return {
+//     slackText: clean(grab('slack')) || clean(text).slice(0, 900),
+//     emailSubject: (clean(grab('email_subject')) || `${clientName}: weekly SEO update`).slice(0, 200),
+//     emailBody: clean(grab('email_body')) || 'The email text was not generated. Click "Generate fresh draft now" to try again.',
+//   };
+// }
+
+// async function writeDigest(client, cmp) {
+//   const facts = digestFacts(client, cmp);
+//   const prompt = `You write the weekly SEO update for "${client.name}". Use ONLY the facts in the JSON. Rules:
+// - "likelyCause" and "likelyCausesForTotals" are rule-based guesses, not facts. Always call them "likely" or "possible", keep the confidence level, and never add a cause that is not in the JSON.
+// - Do not mention AI Overviews or competitors.
+// - If a list is empty, say nothing moved past the thresholds there. Do not invent movement.
+// - Search Console data lags a few days, so it covers an earlier window than GA4. Mention that once if the shift is above 0.
+// - Clicks and impressions are whole numbers. Round other numbers sensibly.
+
+// Write three parts in exactly this format:
+// <slack>
+// For the internal team, in Slack mrkdwn (single *asterisks* for bold, • for bullets), under 900 characters: one headline line, 3 to 5 bullets on the biggest changes, one line on what to check next.
+// </slack>
+// <email_subject>
+// A short, plain subject line.
+// </email_subject>
+// <email_body>
+// For the client contact, plain text with no markdown, 150 to 250 words, friendly and clear: what happened, the likely reasons, and one suggested next step based only on the data. Start with "Hello," and end with "Regards,".
+// </email_body>
+
+// Facts:
+// ${JSON.stringify(facts)}`;
+
+//   const msg = await anthropic.messages.create({
+//     model: 'claude-sonnet-5',
+//     max_tokens: 2500,
+//     thinking: { type: 'disabled' },
+//     messages: [{ role: 'user', content: prompt }],
+//   });
+//   const text = msg.content.find(b => b.type === 'text')?.text || '';
+//   if (!text) throw new Error('Claude returned no text.');
+//   return parseDigest(text, client.name);
+// }
+
+// ---------- Weekly drafts (safe to call any number of times) ----------
+// Week = Monday to Sunday in IST. One draft per client per week.
+
+const DIGEST_TAGS = ['slack', 'email_subject', 'email_summary', 'email_changes', 'email_linkedin', 'email_next'];
+
 function parseDigest(text, clientName) {
-  // Reads <tag>…</tag>. If the closing tag is missing (reply cut off), reads up to the next tag or the end.
+  // Reads <tag>…</tag>. If a closing tag is missing (reply cut off), reads up to the next tag or the end.
+  const any = DIGEST_TAGS.join('|');
   const grab = tag => {
-    const m = text.match(new RegExp(`<${tag}>([\\s\\S]*?)(?:</${tag}>|(?=<(?:slack|email_subject|email_body)>)|$)`));
+    const m = text.match(new RegExp(`<${tag}>([\\s\\S]*?)(?:</${tag}>|(?=<(?:${any})>)|$)`));
     return m ? m[1] : '';
   };
-  const clean = s => s.replace(/<\/?(?:slack|email_subject|email_body)>/g, '').trim();
+  const clean2 = s => s.replace(new RegExp(`</?(?:${any})>`, 'g'), '').trim();
   return {
-    slackText: clean(grab('slack')) || clean(text).slice(0, 900),
-    emailSubject: (clean(grab('email_subject')) || `${clientName}: weekly SEO update`).slice(0, 200),
-    emailBody: clean(grab('email_body')) || 'The email text was not generated. Click "Generate fresh draft now" to try again.',
+    slackText: clean2(grab('slack')) || clean2(text).slice(0, 900),
+    emailSubject: (clean2(grab('email_subject')) || `${clientName}: weekly SEO update`).slice(0, 200),
+    parts: {
+      summary: clean2(grab('email_summary')),
+      changes: clean2(grab('email_changes')),
+      linkedin: clean2(grab('email_linkedin')),
+      next: clean2(grab('email_next')),
+    },
   };
 }
 
 async function writeDigest(client, cmp) {
   const facts = digestFacts(client, cmp);
-  const prompt = `You write the weekly SEO update for "${client.name}". Use ONLY the facts in the JSON. Rules:
+  const prompt = `You write parts of the weekly SEO update for "${client.name}". Use ONLY the facts in the JSON. Rules:
 - "likelyCause" and "likelyCausesForTotals" are rule-based guesses, not facts. Always call them "likely" or "possible", keep the confidence level, and never add a cause that is not in the JSON.
 - Do not mention AI Overviews or competitors.
 - If a list is empty, say nothing moved past the thresholds there. Do not invent movement.
-- Search Console data lags a few days, so it covers an earlier window than GA4. Mention that once if the shift is above 0.
+- Do not write greetings, sign-offs, headings, tables of totals or login details. The system adds those.
 - Clicks and impressions are whole numbers. Round other numbers sensibly.
+- The "linkedin" fact is website traffic measured in Google Analytics (visits, engagement, key events). It has no ad spend, impressions or clicks. Only describe what the fact contains.
 
-Write three parts in exactly this format:
+Write in exactly this format:
 <slack>
-For the internal team, in Slack mrkdwn (single *asterisks* for bold, • for bullets), under 900 characters: one headline line, 3 to 5 bullets on the biggest changes, one line on what to check next.
+For the internal team, in Slack mrkdwn (single *asterisks* for bold, • for bullets), under 900 characters: one headline line, 3 to 5 bullets on the biggest changes (include LinkedIn if present), one line on what to check next.
 </slack>
 <email_subject>
 A short, plain subject line.
 </email_subject>
-<email_body>
-For the client contact, plain text with no markdown, 150 to 250 words, friendly and clear: what happened, the likely reasons, and one suggested next step based only on the data. Start with "Hello," and end with "Regards,".
-</email_body>
+<email_summary>
+2 to 3 plain sentences with the overall picture this week, for the client.
+</email_summary>
+<email_changes>
+3 to 6 lines, each starting with "• ": the biggest search changes (gains first, then things to watch), each with its likely reason in a few words.
+</email_changes>
+<email_linkedin>
+1 to 2 plain sentences on how the LinkedIn traffic performed. Leave this empty if there is no "linkedin" fact.
+</email_linkedin>
+<email_next>
+2 to 3 lines, each starting with "• ": suggested next steps based only on the data.
+</email_next>
 
 Facts:
 ${JSON.stringify(facts)}`;
@@ -1153,11 +1463,10 @@ ${JSON.stringify(facts)}`;
   });
   const text = msg.content.find(b => b.type === 'text')?.text || '';
   if (!text) throw new Error('Claude returned no text.');
-  return parseDigest(text, client.name);
+  const parsed = parseDigest(text, client.name);
+  return { slackText: parsed.slackText, emailSubject: parsed.emailSubject, emailBody: assembleEmail(client, cmp, parsed.parts) };
 }
 
-// ---------- Weekly drafts (safe to call any number of times) ----------
-// Week = Monday to Sunday in IST. One draft per client per week.
 function currentWeekKey() {
   const ist = new Date(Date.now() + 330 * 60000);
   const sinceMonday = (ist.getUTCDay() + 6) % 7;
@@ -1208,6 +1517,8 @@ app.get('/api/delivery', requireAuth, requireAdmin, async (req, res) => {
     hasWebhook: !!c.slackWebhookUrl,
     webhookHint: c.slackWebhookUrl ? `…${c.slackWebhookUrl.slice(-6)}` : '',
     emailRecipients: c.emailRecipients || [],
+    loginUsername: c.loginUsername || '',
+    hasLoginPassword: !!c.loginPasswordEnc,
   })));
 });
 
@@ -1216,11 +1527,25 @@ app.put('/api/clients/:id/delivery', requireAuth, requireAdmin, async (req, res)
   const client = await Client.findById(req.params.id);
   if (!client) return res.status(404).json({ message: 'Client not found.' });
 
-  const { slackWebhookUrl, emailRecipients, weeklyReport, emailEnabled, slackEnabled } = req.body;
+    // If models.js lacks a field, Mongoose silently drops it and the switch would look saved but never persist. Say so instead.
+  const fieldFor = { weeklyReport: 'weeklyReport', emailEnabled: 'emailEnabled', slackEnabled: 'slackEnabled', loginUsername: 'loginUsername', loginPassword: 'loginPasswordEnc' };
+  const missing = Object.entries(fieldFor).filter(([key, path]) => req.body[key] !== undefined && !Client.schema.path(path)).map(([, path]) => path);
+  if (missing.length) {
+    return res.status(500).json({ message: `models.js is missing these fields in clientSchema: ${missing.join(', ')}. Add them, push, and wait for Render to redeploy.` });
+  }
+  
+  // const { slackWebhookUrl, emailRecipients, weeklyReport, emailEnabled, slackEnabled } = req.body;
+    const { slackWebhookUrl, emailRecipients, weeklyReport, emailEnabled, slackEnabled, loginUsername, loginPassword } = req.body;
 
   if (typeof weeklyReport === 'boolean') client.weeklyReport = weeklyReport;
   if (typeof emailEnabled === 'boolean') client.emailEnabled = emailEnabled;
   if (typeof slackEnabled === 'boolean') client.slackEnabled = slackEnabled;
+    if (typeof loginUsername === 'string') client.loginUsername = loginUsername.trim().slice(0, 100);
+  if (typeof loginPassword === 'string') {
+    const pw = loginPassword.trim();
+    if (pw.length > 200) return res.status(400).json({ message: 'That password is too long.' });
+    try { client.loginPasswordEnc = pw ? encryptSecret(pw) : ''; } catch (e) { return res.status(400).json({ message: e.message }); }
+  }
 
   if (typeof slackWebhookUrl === 'string') {
     const url = slackWebhookUrl.trim();
@@ -1319,7 +1644,8 @@ app.post('/api/digests/:id/test-send', requireAuth, requireAdmin, async (req, re
   if (wantSlack && !client?.slackWebhookUrl) return res.status(400).json({ message: 'This client has no Slack webhook saved.' });
 
   const [emailRes, slackRes] = await Promise.allSettled([
-    email ? sendEmail({ to: [email], subject: `[TEST] ${d.emailSubject}`, text: `*** TEST: this was not sent to the client ***\n\n${d.emailBody}` }) : Promise.resolve(),
+    
+    email ? sendEmail({ to: [email], subject: `[TEST] ${d.emailSubject}`, text: `*** TEST: this was not sent to the client ***\n\n${finalEmailText(client || {}, d.emailBody, { masked: true })}` }) : Promise.resolve(),
     wantSlack ? sendSlack(client.slackWebhookUrl, `*[TEST, not the real report]*\n${d.slackText}`) : Promise.resolve(),
   ]);
 
@@ -1356,10 +1682,20 @@ app.post('/api/digests/:id/approve', requireAuth, requireAdmin, async (req, res)
     return release(400, 'Nothing to send to. Turn on Email (with recipients) or Slack (with a webhook) in Delivery settings.');
   }
 
+    let emailText = d.emailBody;
+  if (wantEmail) {
+    try { emailText = finalEmailText(client, d.emailBody); } catch (e) { return release(500, e.message); }
+  }
+
   const [slackRes, emailRes] = await Promise.allSettled([
     wantSlack ? sendSlack(client.slackWebhookUrl, d.slackText) : Promise.resolve(),
-    wantEmail ? sendEmail({ to: client.emailRecipients, subject: d.emailSubject, text: d.emailBody }) : Promise.resolve(),
+    wantEmail ? sendEmail({ to: client.emailRecipients, subject: d.emailSubject, text: emailText }) : Promise.resolve(),
   ]);
+
+  // The dashboard password is for one email only: once it has been delivered, delete it from the server.
+  if (wantEmail && emailRes.status === 'fulfilled' && client.loginPasswordEnc) {
+    await Client.updateOne({ _id: client._id }, { $set: { loginPasswordEnc: '' } });
+  }
 
   const set = {};
   const record = (name, wanted, r) => {

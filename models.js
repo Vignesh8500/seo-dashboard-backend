@@ -7,7 +7,12 @@ const clientSchema = new mongoose.Schema({
   semrushDomain: { type: String, default: null },
   slackWebhookUrl: { type: String, default: '' },
   emailRecipients: { type: [String], default: [] },
+  weeklyReport: { type: Boolean, default: false },
+  emailEnabled: { type: Boolean, default: true },
+  slackEnabled: { type: Boolean, default: true },
   status: { type: String, default: 'pending' },
+  loginUsername: { type: String, default: '' },
+  loginPasswordEnc: { type: String, default: '' },
 }, { timestamps: true });
 
 const snapshotSchema = new mongoose.Schema({
