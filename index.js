@@ -1,4 +1,4 @@
-require('express-async-errors');
+
 const crypto = require('crypto');
 const dns = require('dns');
 dns.setServers(['8.8.8.8', '8.8.4.4']);
