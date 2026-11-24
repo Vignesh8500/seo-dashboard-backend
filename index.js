@@ -1,3 +1,5 @@
+require('express-async-errors');
+const crypto = require('crypto');
 const dns = require('dns');
 dns.setServers(['8.8.8.8', '8.8.4.4']);
 require('dotenv').config();
@@ -13,7 +15,6 @@ const cron = require('node-cron');
 const { google } = require('googleapis');
 const { BetaAnalyticsDataClient } = require('@google-analytics/data');
 const Anthropic = require('@anthropic-ai/sdk');
-const crypto = require('crypto');
 
 
 // ---------- SETUP ----------
@@ -1028,6 +1029,8 @@ async function getMsToken() {
 // }
 
 
+const clean = v => String(v || '').trim().replace(/^["']+|["']+$/g, '').trim();
+
 async function sendEmail({ to, subject, text }) {
   // <br> instead of white-space:pre-wrap, because Outlook ignores pre-wrap and would run the lines together
   //const html = `<div style="font-family:Arial,sans-serif;font-size:14px;line-height:1.5">${escapeHtml(text).replace(/\r?\n/g, '<br>')}</div>`;
@@ -1434,7 +1437,7 @@ async function writeDigest(client, cmp) {
 
 Write in exactly this format:
 <slack>
-For the internal team, in Slack mrkdwn (single *asterisks* for bold, • for bullets), under 900 characters: one headline line, 3 to 5 bullets on the biggest changes (include LinkedIn if present), one line on what to check next.
+For the internal team, in Slack mrkdwn (single *asterisks* for bold, • for bullets), under 900 characters: one headline line, 3 to 5 bullets on the biggest changes (mention LinkedIn only if the "linkedin" fact exists; never mention LinkedIn otherwise), one line on what to check next.
 </slack>
 <email_subject>
 A short, plain subject line.
@@ -1884,6 +1887,15 @@ cron.schedule('0 6 * * *', async () => {
       console.error(`Failed to refresh ${client.name}:`, e.message);
     }
   }
+});
+
+
+
+app.use((err, req, res, next) => {
+  console.error('Unhandled error:', err.stack || err);
+  if (res.headersSent) return next(err);
+  const detail = req.user?.role === 'admin' ? err.message : 'Please try again.';
+  res.status(500).json({ message: `Server error: ${detail}` });
 });
 
 // ---------- START ----------
